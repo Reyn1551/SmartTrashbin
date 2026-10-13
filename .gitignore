@@ -1,0 +1,25 @@
+# --- Hasil build Arduino ---
+build/
+*.bin
+*.elf
+*.map
+*.hex
+
+# --- Cadangan editor ---
+*~
+*.bak
+*.orig
+*.swp
+
+# --- Sistem operasi ---
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- Python ---
+__pycache__/
+*.pyc
+
+# --- Log hasil pengujian ---
+log-smarttrashbin-*.txt
+trashbin-*s-boot*.txt

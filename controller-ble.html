@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+<title>SmartTrashbin · Controller</title>
+<!--
+  ============================================================
+  SMART TRASHBIN — BLE CONTROLLER
+  ============================================================
+  Perubahan dari controller.html asli (OPREC RDC):
+
+  1. Lapisan pengiriman: XMLHttpRequest -> Web Bluetooth (BLE)
+  2. D-pad kiri  : gerak RODA (motor DC via BTN7970)
+  3. Slider      : kecepatan PWM roda, 0-255 (label diperjelas)
+  4. Tombol lid  : TONG KIRI / KANAN -> buka/tutup via STEPPER TB6600
+  5. Kalibrasi   : set posisi stepper sekarang = 0 derajat
+  6. Ditambah    : tombol CONNECT (Web Bluetooth wajib gesture user)
+
+  PERINGATAN PENTING:
+  Web Bluetooth HANYA jalan di secure context. Membuka file ini
+  langsung lewat file:// TIDAK akan bisa connect.
+  Jalankan lewat salah satu cara di CARA-PAKAI-BLE.md
+  ============================================================
+-->
+<style>
+  :root {
+    --bg:        #141311;
+    --panel:     #1f1d1a;
+    --panel-hi:  #2a2724;
+    --line:      #383430;
+    --text:      #f2efe9;
+    --muted:     #8d867c;
+    --brand:     #f0a020;
+    --drive:     #3d7fb8;
+    --drive-hi:  #4e94d0;
+    --stop:      #c0392b;
+    --stop-hi:   #d4503f;
+    --lid-shut:  #4a4642;
+    --lid-open:  #2f8f6a;
+    --warn:      #c9820e;
+    --r-md: 10px;
+    --r-lg: 14px;
+  }
+
+  * {
+    margin: 0; padding: 0;
+    box-sizing: border-box;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none; user-select: none;
+  }
+
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+    touch-action: manipulation;
+  }
+
+  /* ---------- portrait gate ---------- */
+  #gate {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 18px; padding: 28px;
+    background: var(--bg); z-index: 900;
+    text-align: center;
+  }
+  #gate h1 {
+    font-size: 20px; font-weight: 650; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--brand);
+  }
+  #gate p { font-size: 14px; line-height: 1.6; color: var(--muted); max-width: 32ch; }
+  #gate .btn-main {
+    min-height: 52px; padding: 0 32px;
+    font: inherit; font-size: 15px; font-weight: 650; letter-spacing: .08em;
+    color: #1a1613; background: var(--brand);
+    border: 0; border-radius: var(--r-md); cursor: pointer;
+  }
+  #gate .btn-connect {
+    min-height: 52px; padding: 0 32px;
+    font: inherit; font-size: 15px; font-weight: 650; letter-spacing: .08em;
+    color: var(--text); background: var(--drive);
+    border: 0; border-radius: var(--r-md); cursor: pointer;
+  }
+  #gate .btn-connect:disabled { background: var(--line); color: var(--muted); cursor: not-allowed; }
+
+  /* ---------- shell ---------- */
+  #shell {
+    display: none;
+    position: relative;
+    height: 100%;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+
+  .link {
+    position: absolute;
+    top: calc(8px + env(safe-area-inset-top));
+    left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 7px;
+    font-size: 11px; letter-spacing: .06em; color: var(--muted);
+    pointer-events: none; z-index: 60;
+    opacity: 0; transition: opacity 240ms;
+  }
+  .link.show { opacity: 1; }
+  .link i {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--muted); font-style: normal;
+  }
+  .link.show i { background: var(--lid-open); box-shadow: 0 0 0 3px rgba(47,143,106,.18); }
+  .link.warn i { background: var(--warn); box-shadow: 0 0 0 3px rgba(201,130,14,.18); }
+
+  .ghost {
+    position: absolute;
+    top: calc(8px + env(safe-area-inset-top));
+    right: calc(10px + env(safe-area-inset-right));
+    width: 36px; height: 36px;
+    display: grid; place-items: center;
+    color: var(--muted); background: transparent;
+    border: 1px solid transparent; border-radius: var(--r-md);
+    cursor: pointer; transition: color 140ms, border-color 140ms;
+    z-index: 60;
+  }
+  .ghost:hover { color: var(--text); border-color: var(--line); }
+  .ghost svg { width: 16px; height: 16px; }
+
+  /* ---------- main layout ---------- */
+  .deck {
+    --gap: 7px;
+    --overhead: 96px;
+    --pad: max(150px, min(
+             calc(100vh - var(--overhead)),
+             calc((100vw - 380px) / 2),
+             320px
+           ));
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    justify-items: center;
+    gap: 14px;
+    padding: 12px 20px;
+    overflow: auto;
+    min-height: 0;
+    overscroll-behavior: contain;
+  }
+
+  .wing {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 0;
+  }
+
+  .pad-label {
+    font-size: 10px; font-weight: 600; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--muted);
+    margin-bottom: 8px;
+  }
+
+  .drive, .lid-col {
+    width: var(--pad);
+    height: var(--pad);
+    display: grid;
+    gap: var(--gap);
+  }
+
+  .drive {
+    grid-template-columns: repeat(3, 1fr);
+    grid-template-rows: repeat(3, 1fr);
+  }
+
+  .btn {
+    border: 0; font: inherit; color: var(--text);
+    cursor: pointer; border-radius: var(--r-md);
+    display: grid; place-items: center;
+    transition: background 130ms, transform 90ms, filter 130ms;
+    position: relative;
+  }
+  .btn:active { transform: translateY(1px) scale(.975); }
+  .btn .ico { font-size: 15px; line-height: 1; }
+
+  /* ---------- drive pad (RODA) ---------- */
+  .drive .btn {
+    background: var(--drive);
+    box-shadow: inset 0 -2px 0 rgba(0,0,0,.22);
+    min-width: 0; min-height: 0;
+  }
+  .drive .btn:hover { background: var(--drive-hi); }
+  .drive .btn .ico { font-size: calc(var(--pad) / 9); }
+  .drive .stop {
+    background: var(--stop);
+    box-shadow: inset 0 0 0 2px rgba(255,255,255,.55),
+                inset 0 -2px 0 rgba(0,0,0,.22);
+  }
+  .drive .stop:hover { background: var(--stop-hi); }
+  .drive .stop .ico { font-size: calc(var(--pad) / 14); }
+
+  .g-u { grid-area: 1 / 2; } .g-l { grid-area: 2 / 1; }
+  .g-s { grid-area: 2 / 2; } .g-r { grid-area: 2 / 3; }
+  .g-d { grid-area: 3 / 2; }
+
+  /* ---------- middle: speed ---------- */
+  .speed {
+    width: 168px;
+    padding: 16px 16px 14px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    text-align: center;
+  }
+  .speed .readout {
+    font-size: 34px; font-weight: 300; line-height: 1;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -.02em; color: var(--text);
+  }
+  .speed .unit {
+    font-size: 10px; font-weight: 600; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--muted);
+    margin: 3px 0 14px;
+  }
+  .speed .cap {
+    font-size: 10px; font-weight: 600; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--muted);
+    margin-bottom: 6px;
+  }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none;
+    width: 100%; height: 34px; background: transparent; cursor: pointer;
+  }
+  input[type=range]::-webkit-slider-runnable-track {
+    height: 6px; border-radius: 3px;
+    background: linear-gradient(
+      to right, var(--brand) 0 var(--fill, 55%), var(--panel-hi) var(--fill, 55%) 100%);
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 22px; height: 22px; margin-top: -8px;
+    border-radius: 50%; background: var(--text);
+    border: 3px solid var(--bg);
+    box-shadow: 0 0 0 1px var(--line);
+  }
+
+  /* ---------- lid stack (STEPPER) ---------- */
+  .lid-col {
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr auto auto;
+  }
+
+  .lid {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 3px; padding: 5px;
+    min-width: 0; min-height: 0; overflow: hidden;
+    background: var(--lid-shut);
+    box-shadow: inset 0 -2px 0 rgba(0,0,0,.22);
+    transition: background 180ms;
+  }
+  .lid.open { background: var(--lid-open); }
+  .lid:hover { filter: brightness(1.08); }
+  .lid .state {
+    font-size: calc(var(--pad) / 15);
+    font-weight: 700; letter-spacing: .04em; line-height: 1;
+    color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,.28);
+  }
+  .lid .sub {
+    font-size: max(7px, calc(var(--pad) / 42));
+    font-weight: 600; letter-spacing: .06em;
+    text-transform: uppercase; color: #fff; opacity: .88;
+    text-align: center; line-height: 1.25;
+    max-width: 100%; overflow: hidden;
+  }
+  .lid .ico { font-size: calc(var(--pad) / 15); line-height: 1; margin-bottom: 1px; }
+
+  .calib {
+    grid-column: 1 / -1;
+    height: max(30px, calc(var(--pad) / 7));
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: var(--muted);
+    font-size: max(9px, calc(var(--pad) / 26));
+    font-weight: 650; letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 0 6px;
+  }
+  .calib:hover { color: var(--brand); border-color: var(--brand); }
+
+  .apply {
+    grid-column: 1 / -1;
+    height: max(30px, calc(var(--pad) / 7));
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: var(--muted);
+    font-size: max(9px, calc(var(--pad) / 26));
+    font-weight: 650; letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 0 6px;
+  }
+  .apply:hover { color: var(--drive); border-color: var(--drive); }
+
+  /* ---------- connect bar ---------- */
+  #connbar {
+    position: absolute;
+    bottom: calc(8px + env(safe-area-inset-bottom));
+    left: 50%; transform: translateX(-50%);
+    display: flex; gap: 8px; align-items: center;
+    z-index: 70;
+  }
+  #connbar button {
+    font: inherit; font-size: 12px; font-weight: 650;
+    letter-spacing: .08em; text-transform: uppercase;
+    padding: 9px 18px; border: 0; border-radius: var(--r-md);
+    background: var(--drive); color: var(--text); cursor: pointer;
+  }
+  #connbar button:disabled { background: var(--line); color: var(--muted); cursor: not-allowed; }
+  #connbar button.on { background: var(--lid-open); }
+
+  /* ---------- responsive ---------- */
+  @media (orientation: landscape) {
+    #gate { display: none; }
+    #shell { display: grid; }
+  }
+  @media (orientation: landscape) and (max-height: 400px) {
+    .ghost { width: 30px; height: 30px; top: 4px; right: 6px; }
+    .ghost svg { width: 14px; height: 14px; }
+    .deck { --gap: 5px; --overhead: 62px; padding: 6px 14px; gap: 10px; }
+    .pad-label { display: none; }
+    .speed { width: 128px; padding: 9px 10px 8px; }
+    .speed .readout { font-size: 24px; }
+    .speed .unit { margin: 2px 0 8px; }
+    .speed .cap { margin-bottom: 4px; }
+    .calib, .apply { height: 28px; font-size: 9px; }
+    #connbar button { padding: 6px 12px; font-size: 10px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <h1>SmartTrashbin</h1>
+  <p id="gate-msg">Putar perangkat ke posisi mendatar, lalu sambungkan ke robot.</p>
+  <button class="btn-connect" id="gate-connect">1 · HUBUNGKAN ROBOT</button>
+  <button class="btn-main" id="gate-start" disabled>2 · BUKA PANEL</button>
+</div>
+
+<div id="shell">
+  <div class="deck">
+
+    <!-- DRIVE — RODA (motor DC) -->
+    <section class="wing">
+      <p class="pad-label">Gerak · Roda</p>
+      <div class="drive">
+        <button class="btn g-u" data-hold="F" aria-label="Maju"><span class="ico">&#9650;</span></button>
+        <button class="btn g-l" data-hold="L" aria-label="Belok kiri"><span class="ico">&#9664;</span></button>
+        <button class="btn stop g-s" data-tap="P" aria-label="Stop"><span class="ico">&#9632;</span></button>
+        <button class="btn g-r" data-hold="R" aria-label="Belok kanan"><span class="ico">&#9654;</span></button>
+        <button class="btn g-d" data-hold="B" aria-label="Mundur"><span class="ico">&#9660;</span></button>
+      </div>
+    </section>
+
+    <!-- SPEED — PWM roda -->
+    <section class="speed">
+      <div class="readout" id="pwm-out">140</div>
+      <div class="unit">PWM · Roda</div>
+      <div class="cap">Kecepatan</div>
+      <input type="range" min="0" max="255" value="140" id="pwm" aria-label="Kecepatan motor roda">
+    </section>
+
+    <!-- LIDS — STEPPER -->
+    <section class="wing">
+      <p class="pad-label">Tutup · Stepper</p>
+      <div class="lid-col">
+        <button class="btn lid" id="lid-left" aria-pressed="false">
+          <span class="ico">&#9664;</span>
+          <span class="sub">TONG<br>KIRI</span>
+          <span class="state" id="left-state">TUTUP</span>
+        </button>
+        <button class="btn lid" id="lid-right" aria-pressed="false">
+          <span class="ico">&#9654;</span>
+          <span class="sub">TONG<br>KANAN</span>
+          <span class="state" id="right-state">TUTUP</span>
+        </button>
+        <button class="btn calib" id="btn-calib">Kalibrasi · 0&deg;</button>
+        <button class="btn apply" id="btn-apply">Tutup Kedua Lid</button>
+      </div>
+    </section>
+
+  </div>
+
+  <div class="link" id="link"><i></i><span id="link-txt"></span></div>
+
+  <div id="connbar">
+    <button id="btn-connect">Hubungkan</button>
+  </div>
+
+  <button class="ghost" id="btn-fs" aria-label="Layar penuh">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+         stroke-linecap="round" stroke-linejoin="round">
+      <path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/>
+    </svg>
+  </button>
+</div>
+
+<script>
+/* ============================================================
+   BLE LAYER
+   ============================================================ */
+const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+const CHAR_RX_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+const CHAR_TX_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a9';
+
+let bleDevice = null;
+let bleRx = null;   // tulis ke sini (HP -> ESP32)
+let bleTx = null;   // notify dari sini (ESP32 -> HP)
+
+const connBtn = document.getElementById('btn-connect');
+const gateConnBtn = document.getElementById('gate-connect');
+const gateStart = document.getElementById('gate-start');
+const gateMsg = document.getElementById('gate-msg');
+
+function setConn(kind, text) {
+  connBtn.classList.toggle('on', kind === 'on');
+  connBtn.textContent = text;
+  gateConnBtn.classList.toggle('on', kind === 'on');
+  gateConnBtn.textContent = kind === 'on' ? '✓ TERSAMBUNG' : '1 · HUBUNGKAN ROBOT';
+  gateStart.disabled = (kind !== 'on');
+  if (kind === 'on') gateMsg.textContent = 'Robot tersambung. Buka panel kendali.';
+}
+
+async function connectBLE() {
+  if (!navigator.bluetooth) {
+    setConn('off', 'Tidak didukung');
+    showLog('Browser ini tidak mendukung Web Bluetooth. Pakai Chrome/Edge di Android.', true);
+    gateMsg.textContent = 'Browser tidak mendukung Web Bluetooth. Pakai Chrome/Edge Android.';
+    return;
+  }
+  try {
+    setConn('off', 'Mencari…');
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'SmartTrashbin' }],
+      optionalServices: [SERVICE_UUID]
+    });
+    bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
+
+    const server  = await bleDevice.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+
+    bleRx = await service.getCharacteristic(CHAR_RX_UUID);
+    bleTx = await service.getCharacteristic(CHAR_TX_UUID);
+
+    await bleTx.startNotifications();
+    bleTx.addEventListener('characteristicvaluechanged', onNotify);
+
+    setConn('on', 'Tersambung');
+    showLog('tersambung ke ' + bleDevice.name);
+  } catch (e) {
+    setConn('off', 'Hubungkan');
+    showLog('gagal: ' + e.message, true);
+  }
+}
+
+function onDisconnected() {
+  bleRx = null; bleTx = null;
+  setConn('off', 'Hubungkan');
+  showLog('robot terputus', true);
+  // Safety: kalau HP putus saat roda jalan, robot harus berhenti.
+  send('P');
+}
+
+/* Kirim perintah. Kalau tidak tersambung, beri tahu sekali saja. */
+function send(cmd) {
+  if (!bleRx) { showLog('belum tersambung', true); return; }
+  const data = new TextEncoder().encode(cmd);
+  bleRx.writeValueWithoutResponse(data)
+    .catch(function () {
+      return bleRx.writeValue(data);   // fallback kalau tanpa-response ditolak
+    })
+    .catch(function (e) { showLog('kirim gagal: ' + e.message, true); });
+}
+
+function onNotify(ev) {
+  const txt = new TextDecoder().decode(ev.target.value);
+  try {
+    const parts = {};
+    txt.split(';').forEach(function (kv) {
+      const i = kv.indexOf('=');
+      if (i > 0) parts[kv.slice(0, i)] = kv.slice(i + 1);
+    });
+    if (parts.LL !== undefined && parts.LR !== undefined) {
+      const ang = parseFloat(parts.LL);
+      const open = parseFloat(parts.LOPEN) || 90;
+      paintLid('left',  ang > open * 0.5);
+      paintLid('right', parseFloat(parts.LR) > open * 0.5);
+    }
+    if (parts.SP !== undefined) {
+      const sp = parseInt(parts.SP, 10);
+      if (!isNaN(sp)) { slider.value = sp; onSlide(sp); }
+    }
+  } catch (e) { /* abaikan */ }
+}
+
+connBtn.addEventListener('click', connectBLE);
+gateConnBtn.addEventListener('click', connectBLE);
+
+/* ============================================================
+   DRIVE — tekan-tahan supaya robot tidak lari sendiri
+   ============================================================ */
+let HELD = 'P';
+function begin(cmd) { HELD = cmd; send(cmd); }
+function release()  { if (HELD !== 'P') { HELD = 'P'; send('P'); } }
+
+document.querySelectorAll('[data-hold]').forEach(function (b) {
+  const cmd = b.dataset.hold;
+  b.addEventListener('pointerdown', function (e) { e.preventDefault(); begin(cmd); });
+  b.addEventListener('pointerup', release);
+  b.addEventListener('pointercancel', release);
+  b.addEventListener('pointerleave', function () { if (HELD === cmd) release(); });
+});
+document.querySelectorAll('[data-tap]').forEach(function (b) {
+  b.addEventListener('click', function () { send(b.dataset.tap); });
+});
+
+/* pengaman: pointer hilang di tengah tekan tidak boleh meninggalkan roda jalan */
+window.addEventListener('blur', release);
+window.addEventListener('pointerup', release);
+
+/* ============================================================
+   SPEED — PWM roda
+   ============================================================ */
+const slider = document.getElementById('pwm');
+const out    = document.getElementById('pwm-out');
+
+function onSlide(v) {
+  out.textContent = v;
+  slider.style.setProperty('--fill', (v / 255 * 100) + '%');
+}
+slider.addEventListener('input', function () { onSlide(slider.value); });
+slider.addEventListener('change', function () { send('V' + slider.value); });
+onSlide(slider.value);
+
+/* ============================================================
+   LID — stepper
+   Firmware punya SATU perintah 'C' yang menggerakkan kedua lid
+   bersamaan. Status open/close di UI ini karenanya optimistis:
+   ia menampilkan niat perintah, bukan posisi fisik tiap lid.
+   Saat firmware mendukung lid per-sisi, ganti di sini saja.
+   ============================================================ */
+const lids = { left: false, right: false };   /* false = tutup */
+
+function paintLid(side, isOpen) {
+  lids[side] = isOpen;
+  const el = document.getElementById('lid-' + side);
+  el.classList.toggle('open', isOpen);
+  el.setAttribute('aria-pressed', String(isOpen));
+  document.getElementById(side + '-state').textContent = isOpen ? 'TERBUKA' : 'TUTUP';
+}
+
+function toggleLid(side) {
+  const next = !lids[side];
+  send(next ? 'C' : 'S');
+  paintLid('left',  next);
+  paintLid('right', next);
+}
+
+document.getElementById('lid-left').addEventListener('click', function () { toggleLid('left'); });
+document.getElementById('lid-right').addEventListener('click', function () { toggleLid('right'); });
+
+document.getElementById('btn-calib').addEventListener('click', function () {
+  send('A');
+  paintLid('left', false);
+  paintLid('right', false);
+  showLog('kalibrasi: posisi = 0°');
+});
+
+document.getElementById('btn-apply').addEventListener('click', function () {
+  send('S');
+  paintLid('left', false);
+  paintLid('right', false);
+  showLog('tutup kedua lid');
+});
+
+paintLid('left', false);
+paintLid('right', false);
+
+/* ============================================================
+   FULLSCREEN
+   ============================================================ */
+document.getElementById('gate-start').addEventListener('click', function () {
+  const el = document.documentElement;
+  const r  = el.requestFullscreen || el.webkitRequestFullscreen;
+  if (r) { try { r.call(el); } catch (e) {} }
+  if (screen.orientation && screen.orientation.lock) {
+    screen.orientation.lock('landscape').catch(function () {});
+  }
+});
+
+document.getElementById('btn-fs').addEventListener('click', function () {
+  if (document.fullscreenElement || document.webkitFullscreenElement) {
+    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+  } else {
+    const el = document.documentElement;
+    (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+  }
+});
+document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+/* ============================================================
+   STATUS LINE
+   ============================================================ */
+let logTimer = null;
+function showLog(msg, warn) {
+  const l = document.getElementById('link');
+  document.getElementById('link-txt').textContent = msg;
+  l.classList.toggle('warn', !!warn);
+  l.classList.add('show');
+  clearTimeout(logTimer);
+  logTimer = setTimeout(function () { l.classList.remove('show'); }, 1800);
+}
+
+/* Kabari lebih awal kalau browser memang tidak mendukung */
+if (!navigator.bluetooth) {
+  gateMsg.textContent = 'Browser ini tidak mendukung Web Bluetooth. Gunakan Chrome atau Edge di Android.';
+  gateConnBtn.disabled = true;
+  connBtn.disabled = true;
+  connBtn.textContent = 'Tidak didukung';
+}
+</script>
+</body>
+</html>

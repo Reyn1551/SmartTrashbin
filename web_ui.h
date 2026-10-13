@@ -1,0 +1,691 @@
+// ============================================================
+//  web_ui.h  --  DIBUAT OTOMATIS oleh konversi-html.py
+//  JANGAN EDIT FILE INI LANGSUNG.
+//  Edit controller-wifi.html, lalu jalankan:
+//      python konversi-html.py
+//
+//  Sumber : controller-wifi.html (23049 byte, 674 baris)
+//  Berisi : halaman controller yang disajikan ESP32 di http://192.168.4.1
+// ============================================================
+
+#ifndef WEB_UI_H
+#define WEB_UI_H
+
+#include <Arduino.h>
+
+const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+<title>SmartTrashbin · WiFi Controller</title>
+<!--
+  ============================================================
+  SMART TRASHBIN — WIFI CONTROLLER (ESP32 Access Point)
+  ============================================================
+  Halaman ini DI-EMBED di dalam firmware ESP32. Buka di browser:
+      http://192.168.4.1
+  Tidak perlu server laptop, tidak perlu file di HP.
+
+  Kontrol:
+    - D-pad kiri  : gerak RODA (motor DC via BTN7970)
+    - Slider      : kecepatan PWM roda 0-255
+    - Tombol lid  : TONG KIRI/KANAN -> buka/tutup via STEPPER TB6600
+    - Kalibrasi   : set posisi stepper sekarang = 0 derajat
+
+  Perbedaan dari versi BLE:
+    - Komunikasi: Web Bluetooth -> HTTP fetch (jauh lebih sederhana)
+    - Tidak perlu tap "connect" tiap kali buka halaman
+    - Status robot diambil lewat polling /status tiap 1 detik
+  ============================================================
+-->
+<style>
+  :root {
+    --bg:        #141311;
+    --panel:     #1f1d1a;
+    --panel-hi:  #2a2724;
+    --line:      #383430;
+    --text:      #f2efe9;
+    --muted:     #8d867c;
+    --brand:     #f0a020;
+    --drive:     #3d7fb8;
+    --drive-hi:  #4e94d0;
+    --stop:      #c0392b;
+    --stop-hi:   #d4503f;
+    --lid-shut:  #4a4642;
+    --lid-open:  #2f8f6a;
+    --warn:      #c9820e;
+    --r-md: 10px;
+    --r-lg: 14px;
+  }
+
+  * {
+    margin: 0; padding: 0;
+    box-sizing: border-box;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none; user-select: none;
+  }
+
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+    touch-action: manipulation;
+  }
+
+  /* ---------- portrait gate ---------- */
+  #gate {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 18px; padding: 28px;
+    background: var(--bg); z-index: 900;
+    text-align: center;
+  }
+  #gate h1 {
+    font-size: 20px; font-weight: 650; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--brand);
+  }
+  #gate p { font-size: 14px; line-height: 1.6; color: var(--muted); max-width: 32ch; }
+  #gate .btn-main {
+    min-height: 52px; padding: 0 32px;
+    font: inherit; font-size: 15px; font-weight: 650; letter-spacing: .08em;
+    color: #1a1613; background: var(--brand);
+    border: 0; border-radius: var(--r-md); cursor: pointer;
+  }
+
+  /* ---------- shell ---------- */
+  #shell {
+    display: none;
+    position: relative;
+    height: 100%;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+
+  .link {
+    position: absolute;
+    top: calc(8px + env(safe-area-inset-top));
+    left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 7px;
+    font-size: 11px; letter-spacing: .06em; color: var(--muted);
+    pointer-events: none; z-index: 60;
+    opacity: 0; transition: opacity 240ms;
+  }
+  .link.show { opacity: 1; }
+  .link i {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--muted); font-style: normal;
+  }
+  .link.show i { background: var(--lid-open); box-shadow: 0 0 0 3px rgba(47,143,106,.18); }
+  .link.warn i { background: var(--warn); box-shadow: 0 0 0 3px rgba(201,130,14,.18); }
+
+  .ghost {
+    position: absolute;
+    top: calc(8px + env(safe-area-inset-top));
+    right: calc(10px + env(safe-area-inset-right));
+    width: 36px; height: 36px;
+    display: grid; place-items: center;
+    color: var(--muted); background: transparent;
+    border: 1px solid transparent; border-radius: var(--r-md);
+    cursor: pointer; transition: color 140ms, border-color 140ms;
+    z-index: 60;
+  }
+  .ghost:hover { color: var(--text); border-color: var(--line); }
+  .ghost svg { width: 16px; height: 16px; }
+
+  /* ---------- main layout ---------- */
+  .deck {
+    --gap: 7px;
+    --overhead: 96px;
+    --pad: max(150px, min(
+             calc(100vh - var(--overhead)),
+             calc((100vw - 380px) / 2),
+             320px
+           ));
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    justify-items: center;
+    gap: 14px;
+    padding: 12px 20px;
+    overflow: auto;
+    min-height: 0;
+    overscroll-behavior: contain;
+  }
+
+  .wing {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 0;
+  }
+
+  .pad-label {
+    font-size: 10px; font-weight: 600; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--muted);
+    margin-bottom: 8px;
+  }
+
+  .drive, .lid-col {
+    width: var(--pad);
+    height: var(--pad);
+    display: grid;
+    gap: var(--gap);
+  }
+
+  .drive {
+    grid-template-columns: repeat(3, 1fr);
+    grid-template-rows: repeat(3, 1fr);
+  }
+
+  .btn {
+    border: 0; font: inherit; color: var(--text);
+    cursor: pointer; border-radius: var(--r-md);
+    display: grid; place-items: center;
+    transition: background 130ms, transform 90ms, filter 130ms;
+    position: relative;
+    /* touch-action: none mencegah browser mengubah sentuhan menjadi
+       scroll atau gesture. Tanpa ini, menggeser jari sedikit saat
+       menahan tombol bisa memicu pointercancel dan robot berhenti
+       sendiri walau tombol masih ditahan. */
+    touch-action: none;
+    -webkit-touch-callout: none;
+  }
+  .btn:active { transform: translateY(1px) scale(.975); }
+  .btn .ico { font-size: 15px; line-height: 1; }
+
+  /* Tombol yang sedang ditahan: beri tanda jelas supaya pengguna tahu
+     perintahnya benar-benar aktif. */
+  .btn.held {
+    background: var(--drive-hi);
+    box-shadow: inset 0 0 0 2px rgba(120,190,255,.85);
+  }
+
+  /* ---------- drive pad (RODA) ---------- */
+  .drive .btn {
+    background: var(--drive);
+    box-shadow: inset 0 -2px 0 rgba(0,0,0,.22);
+    min-width: 0; min-height: 0;
+  }
+  .drive .btn:hover { background: var(--drive-hi); }
+  .drive .btn .ico { font-size: calc(var(--pad) / 9); }
+  .drive .stop {
+    background: var(--stop);
+    box-shadow: inset 0 0 0 2px rgba(255,255,255,.55),
+                inset 0 -2px 0 rgba(0,0,0,.22);
+  }
+  .drive .stop:hover { background: var(--stop-hi); }
+  .drive .stop .ico { font-size: calc(var(--pad) / 14); }
+
+  .g-u { grid-area: 1 / 2; } .g-l { grid-area: 2 / 1; }
+  .g-s { grid-area: 2 / 2; } .g-r { grid-area: 2 / 3; }
+  .g-d { grid-area: 3 / 2; }
+
+  /* ---------- middle: speed ---------- */
+  .speed {
+    width: 168px;
+    padding: 16px 16px 14px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    text-align: center;
+  }
+  .speed .readout {
+    font-size: 34px; font-weight: 300; line-height: 1;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -.02em; color: var(--text);
+  }
+  .speed .unit {
+    font-size: 10px; font-weight: 600; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--muted);
+    margin: 3px 0 14px;
+  }
+  .speed .cap {
+    font-size: 10px; font-weight: 600; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--muted);
+    margin-bottom: 6px;
+  }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none;
+    width: 100%; height: 34px; background: transparent; cursor: pointer;
+  }
+  input[type=range]::-webkit-slider-runnable-track {
+    height: 6px; border-radius: 3px;
+    background: linear-gradient(
+      to right, var(--brand) 0 var(--fill, 55%), var(--panel-hi) var(--fill, 55%) 100%);
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 22px; height: 22px; margin-top: -8px;
+    border-radius: 50%; background: var(--text);
+    border: 3px solid var(--bg);
+    box-shadow: 0 0 0 1px var(--line);
+  }
+
+  /* ---------- lid stack (STEPPER) ---------- */
+  .lid-col {
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr auto auto;
+  }
+
+  .lid {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 3px; padding: 5px;
+    min-width: 0; min-height: 0; overflow: hidden;
+    background: var(--lid-shut);
+    box-shadow: inset 0 -2px 0 rgba(0,0,0,.22);
+    transition: background 180ms;
+  }
+  .lid.open { background: var(--lid-open); }
+  .lid:hover { filter: brightness(1.08); }
+  .lid .state {
+    font-size: calc(var(--pad) / 15);
+    font-weight: 700; letter-spacing: .04em; line-height: 1;
+    color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,.28);
+  }
+  .lid .sub {
+    font-size: max(7px, calc(var(--pad) / 42));
+    font-weight: 600; letter-spacing: .06em;
+    text-transform: uppercase; color: #fff; opacity: .88;
+    text-align: center; line-height: 1.25;
+    max-width: 100%; overflow: hidden;
+  }
+  .lid .ico { font-size: calc(var(--pad) / 15); line-height: 1; margin-bottom: 1px; }
+
+  .calib {
+    grid-column: 1 / -1;
+    height: max(30px, calc(var(--pad) / 7));
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: var(--muted);
+    font-size: max(9px, calc(var(--pad) / 26));
+    font-weight: 650; letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 0 6px;
+  }
+  .calib:hover { color: var(--brand); border-color: var(--brand); }
+
+  .apply {
+    grid-column: 1 / -1;
+    height: max(30px, calc(var(--pad) / 7));
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: var(--muted);
+    font-size: max(9px, calc(var(--pad) / 26));
+    font-weight: 650; letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 0 6px;
+  }
+  .apply:hover { color: var(--drive); border-color: var(--drive); }
+
+  /* ---------- status bar ---------- */
+  #connbar {
+    position: absolute;
+    bottom: calc(8px + env(safe-area-inset-bottom));
+    left: 50%; transform: translateX(-50%);
+    display: flex; gap: 8px; align-items: center;
+    z-index: 70;
+    font-size: 11px; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--muted);
+  }
+  #connbar .dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--muted);
+  }
+  #connbar.on .dot { background: var(--lid-open); box-shadow: 0 0 0 3px rgba(47,143,106,.18); }
+  #connbar.off .dot { background: var(--stop); box-shadow: 0 0 0 3px rgba(192,57,43,.18); }
+
+  /* ---------- responsive ---------- */
+  @media (orientation: landscape) {
+    #gate { display: none; }
+    #shell { display: grid; }
+  }
+  @media (orientation: landscape) and (max-height: 400px) {
+    .ghost { width: 30px; height: 30px; top: 4px; right: 6px; }
+    .ghost svg { width: 14px; height: 14px; }
+    .deck { --gap: 5px; --overhead: 62px; padding: 6px 14px; gap: 10px; }
+    .pad-label { display: none; }
+    .speed { width: 128px; padding: 9px 10px 8px; }
+    .speed .readout { font-size: 24px; }
+    .speed .unit { margin: 2px 0 8px; }
+    .speed .cap { margin-bottom: 4px; }
+    .calib, .apply { height: 28px; font-size: 9px; }
+    #connbar { font-size: 9px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <h1>SmartTrashbin</h1>
+  <p id="gate-msg">Putar perangkat ke posisi mendatar, lalu buka panel kendali.</p>
+  <button class="btn-main" id="gate-start">BUKA PANEL</button>
+</div>
+
+<div id="shell">
+  <div class="deck">
+
+    <!-- DRIVE — RODA (motor DC) -->
+    <section class="wing">
+      <p class="pad-label">Gerak · Roda</p>
+      <div class="drive">
+        <button class="btn g-u" data-hold="F" aria-label="Maju"><span class="ico">&#9650;</span></button>
+        <button class="btn g-l" data-hold="L" aria-label="Belok kiri"><span class="ico">&#9664;</span></button>
+        <button class="btn stop g-s" data-tap="P" aria-label="Stop"><span class="ico">&#9632;</span></button>
+        <button class="btn g-r" data-hold="R" aria-label="Belok kanan"><span class="ico">&#9654;</span></button>
+        <button class="btn g-d" data-hold="B" aria-label="Mundur"><span class="ico">&#9660;</span></button>
+      </div>
+    </section>
+
+    <!-- SPEED — PWM roda -->
+    <section class="speed">
+      <div class="readout" id="pwm-out">140</div>
+      <div class="unit">PWM · Roda</div>
+      <div class="cap">Kecepatan</div>
+      <input type="range" min="0" max="255" value="140" id="pwm" aria-label="Kecepatan motor roda">
+    </section>
+
+    <!-- LIDS — STEPPER -->
+    <section class="wing">
+      <p class="pad-label">Tutup · Stepper</p>
+      <div class="lid-col">
+        <button class="btn lid" id="lid-left" aria-pressed="false">
+          <span class="ico">&#9664;</span>
+          <span class="sub">TONG<br>KIRI</span>
+          <span class="state" id="left-state">TUTUP</span>
+        </button>
+        <button class="btn lid" id="lid-right" aria-pressed="false">
+          <span class="ico">&#9654;</span>
+          <span class="sub">TONG<br>KANAN</span>
+          <span class="state" id="right-state">TUTUP</span>
+        </button>
+        <button class="btn calib" id="btn-calib">Kalibrasi · 0&deg;</button>
+        <button class="btn apply" id="btn-apply">Tutup Kedua Lid</button>
+      </div>
+    </section>
+
+  </div>
+
+  <div class="link" id="link"><i></i><span id="link-txt"></span></div>
+
+  <div id="connbar">
+    <span class="dot"></span><span id="conn-txt">menyambung…</span>
+  </div>
+
+  <button class="ghost" id="btn-fs" aria-label="Layar penuh">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+         stroke-linecap="round" stroke-linejoin="round">
+      <path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/>
+    </svg>
+  </button>
+</div>
+
+<script>
+/* ============================================================
+   HTTP LAYER  (pengganti Web Bluetooth)
+   Kirim perintah sebagai GET request. Pakai fetch()+keepalive
+   supaya request tetap terkirim walau halaman sedang sibuk.
+   ============================================================ */
+
+let online = false;
+
+/* Kirim perintah ke ESP32. Tidak menunggu balasan supaya
+   tombol tetap responsif walau WiFi lambat. */
+function send(cmd) {
+  fetch('/cmd?val=' + encodeURIComponent(cmd), { cache: 'no-store' })
+    .then(function () { markOnline(true); })
+    .catch(function () { markOnline(false); showLog('robot tidak merespons', true); });
+}
+
+function markOnline(ok) {
+  const bar = document.getElementById('connbar');
+  bar.classList.toggle('on', ok);
+  bar.classList.toggle('off', !ok);
+  document.getElementById('conn-txt').textContent = ok ? 'terhubung' : 'terputus';
+  online = ok;
+}
+
+/* Ambil status robot untuk menyinkronkan tampilan lid & kecepatan. */
+function pollStatus() {
+  fetch('/status', { cache: 'no-store' })
+    .then(function (r) { return r.json(); })
+    .then(function (s) {
+      markOnline(true);
+      /* Sinkronkan dari posisi stepper sebenarnya, tapi HANYA kalau
+         sisi itu sedang tidak digerakkan (bl=0). Kalau motor masih
+         bergerak, jangan timpa tampilan supaya tidak berkedip. */
+      if (!s.bl) {
+        const open = s.lopen || 90;
+        paintLid('left',  s.ll > open * 0.5);
+        paintLid('right', s.lr > open * 0.5);
+      }
+      if (typeof s.sp === 'number' && document.activeElement !== slider) {
+        slider.value = s.sp;
+        onSlide(s.sp);
+      }
+    })
+    .catch(function () { markOnline(false); });
+}
+setInterval(pollStatus, 1000);
+pollStatus();
+
+/* ============================================================
+   DRIVE — tekan-tahan: jalan terus selama tombol DITAHAN
+   ============================================================
+   Perbaikan penting:
+   1. `pointerleave` DIHAPUS. Dulu jari yang sedikit bergeser di atas
+      tombol memicu pointerleave dan langsung menghentikan robot,
+      sehingga terasa "berhenti sendiri setelah beberapa detik".
+      Sekarang yang menghentikan hanya jari diangkat (pointerup),
+      tombol dibatalkan (pointercancel), atau aplikasi kehilangan fokus.
+   2. `setPointerCapture` dipakai supaya semua gerakan jari tetap
+      dikirim ke tombol yang sama walau jari keluar dari area tombol.
+   3. `touch-action: none` di CSS mencegah browser menyerahkan gesture
+      ke scroll, yang bisa membatalkan pointer (pointercancel).
+*/
+let HELD = 'P';
+let HELD_BTN = null;
+let hbTimer = null;
+
+/* Heartbeat: selama tombol ditahan, kirim ulang perintahnya setiap
+   1.5 detik. Firmware punya pengaman yang menghentikan roda kalau tidak
+   ada perintah selama beberapa detik. Tanpa heartbeat, satu koneksi
+   WiFi yang tersendat saja sudah cukup membuat robot berhenti sendiri
+   padahal jari masih menahan tombol. Dengan heartbeat, gerakan tetap
+   berjalan sampai tombol benar-benar dilepas. */
+function mulaiHeartbeat(cmd) {
+  hentikanHeartbeat();
+  hbTimer = setInterval(function () {
+    if (HELD === 'P') { hentikanHeartbeat(); return; }
+    send(HELD);
+  }, 1500);
+}
+
+function hentikanHeartbeat() {
+  if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+}
+
+function begin(cmd, btn, ev) {
+  /* Lepas apa pun yang masih dipegang sebelumnya */
+  if (HELD_BTN && HELD_BTN !== btn) {
+    try { HELD_BTN.releasePointerCapture(ev.pointerId); } catch (e) {}
+  }
+
+  /* Kunci pointer ke tombol ini supaya pointerleave tidak terjadi */
+  try { btn.setPointerCapture(ev.pointerId); } catch (e) {}
+
+  HELD = cmd;
+  HELD_BTN = btn;
+  btn.classList.add('held');
+  send(cmd);
+  mulaiHeartbeat(cmd);
+}
+
+function release() {
+  hentikanHeartbeat();
+  if (HELD_BTN) {
+    HELD_BTN.classList.remove('held');
+    HELD_BTN = null;
+  }
+  if (HELD !== 'P') {
+    HELD = 'P';
+    send('P');
+  }
+}
+
+document.querySelectorAll('[data-hold]').forEach(function (b) {
+  const cmd = b.dataset.hold;
+
+  b.addEventListener('pointerdown', function (e) {
+    e.preventDefault();
+    begin(cmd, b, e);
+  });
+
+  /* Hanya jari diangkat yang menghentikan */
+  b.addEventListener('pointerup', release);
+  b.addEventListener('pointercancel', release);
+
+  /* Klik kanan / menu konteks jangan memutus gerakan */
+  b.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+  /* Kalau browser tetap kehilangan pointer (mis. jari keluar layar),
+     pastikan tidak ada yang tertinggal dalam keadaan jalan. */
+  b.addEventListener('lostpointercapture', function () {
+    if (HELD_BTN === b) release();
+  });
+});
+
+/* Di beberapa browser lama, pointerup bisa tidak sampai ke tombol.
+   Listener global ini jadi jaring pengaman terakhir, tapi hanya aktif
+   kalau memang ada tombol yang sedang dipegang. */
+window.addEventListener('pointerup', function () {
+  if (HELD_BTN) release();
+});
+window.addEventListener('pointercancel', function () {
+  if (HELD_BTN) release();
+});
+
+/* Pengaman: aplikasi kehilangan fokus atau tab disembunyikan -> stop.
+   Ini penting supaya robot tidak terus jalan kalau pengguna berpindah
+   aplikasi dan tidak pernah melepas tombolnya. */
+window.addEventListener('blur', release);
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden) release();
+});
+
+document.querySelectorAll('[data-tap]').forEach(function (b) {
+  b.addEventListener('click', function () { send(b.dataset.tap); });
+});
+
+/* ============================================================
+   SPEED — PWM roda
+   ============================================================ */
+const slider = document.getElementById('pwm');
+const out    = document.getElementById('pwm-out');
+
+function onSlide(v) {
+  out.textContent = v;
+  slider.style.setProperty('--fill', (v / 255 * 100) + '%');
+}
+slider.addEventListener('input', function () { onSlide(slider.value); });
+slider.addEventListener('change', function () { send('V' + slider.value); });
+onSlide(slider.value);
+
+/* ============================================================
+   LID — stepper (KENDALI PER SISI)
+   Firmware punya perintah 'I' dengan argumen sisi:
+     IL1 / IL0  -> buka / tutup lid KIRI saja
+     IR1 / IR0  -> buka / tutup lid KANAN saja
+   Tombol hanya mengubah tampilan sisi yang benar-benar diklik —
+   sisi lain TIDAK ikut berubah.
+   ============================================================ */
+const lids = { left: false, right: false };
+
+function paintLid(side, isOpen) {
+  if (lids[side] === isOpen &&
+      document.getElementById(side + '-state').textContent === (isOpen ? 'TERBUKA' : 'TUTUP')) {
+    return;  /* tidak ada perubahan, hindari kerja DOM tiap detik */
+  }
+  lids[side] = isOpen;
+  const el = document.getElementById('lid-' + side);
+  el.classList.toggle('open', isOpen);
+  el.setAttribute('aria-pressed', String(isOpen));
+  document.getElementById(side + '-state').textContent = isOpen ? 'TERBUKA' : 'TUTUP';
+}
+
+/* Klik tombol lid -> gerakkan HANYA sisi itu. */
+function toggleLid(side) {
+  const next = !lids[side];
+  const arg  = (side === 'left' ? 'L' : 'R') + (next ? '1' : '0');
+  send('I' + arg);
+
+  paintLid(side, next);                       // hanya sisi yang diklik
+  showLog((next ? 'buka' : 'tutup') + ' lid ' + (side === 'left' ? 'kiri' : 'kanan'));
+}
+
+document.getElementById('lid-left').addEventListener('click', function () { toggleLid('left'); });
+document.getElementById('lid-right').addEventListener('click', function () { toggleLid('right'); });
+
+document.getElementById('btn-calib').addEventListener('click', function () {
+  send('A');
+  paintLid('left', false);
+  paintLid('right', false);
+  showLog('kalibrasi: posisi = 0°');
+});
+
+document.getElementById('btn-apply').addEventListener('click', function () {
+  send('S');
+  paintLid('left', false);
+  paintLid('right', false);
+  showLog('tutup kedua lid');
+});
+
+paintLid('left', false);
+paintLid('right', false);
+
+/* ============================================================
+   FULLSCREEN
+   ============================================================ */
+document.getElementById('gate-start').addEventListener('click', function () {
+  const el = document.documentElement;
+  const r  = el.requestFullscreen || el.webkitRequestFullscreen;
+  if (r) { try { r.call(el); } catch (e) {} }
+  if (screen.orientation && screen.orientation.lock) {
+    screen.orientation.lock('landscape').catch(function () {});
+  }
+});
+
+document.getElementById('btn-fs').addEventListener('click', function () {
+  if (document.fullscreenElement || document.webkitFullscreenElement) {
+    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+  } else {
+    const el = document.documentElement;
+    (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+  }
+});
+document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+/* ============================================================
+   STATUS LINE
+   ============================================================ */
+let logTimer = null;
+function showLog(msg, warn) {
+  const l = document.getElementById('link');
+  document.getElementById('link-txt').textContent = msg;
+  l.classList.toggle('warn', !!warn);
+  l.classList.add('show');
+  clearTimeout(logTimer);
+  logTimer = setTimeout(function () { l.classList.remove('show'); }, 1800);
+}
+</script>
+</body>
+</html>
+)rawliteral";
+
+#endif  // WEB_UI_H
