@@ -1,12 +1,35 @@
 # Mengatur Torsi Stepper: Apa yang Bisa dan Tidak Bisa
 
+## Setelan yang dipakai sekarang
+
+| Parameter | Nilai |
+|---|---|
+| Microstep | **1/8** (DIP SW1=OFF, SW2=ON, SW3=OFF) |
+| `STEPS_PER_REV` | 1600 |
+| `STEPS_PER_DEG` | 4.4444 |
+| Torsi per langkah | 19,51 % dari torsi holding |
+| Arus TB6600 | **2,0 A** (SW4=ON, SW5=OFF, SW6=OFF) |
+
+Profil kecepatan:
+
+| Profil | Stepper | PWM roda |
+|---|---|---|
+| SLOW | 200 step/detik | 45 |
+| MEDIUM | 450 step/detik | 110 |
+| FAST | 800 step/detik | 200 |
+
+Angka step per detik ini sengaja **separuh** dari nilai saat microstep
+1/16, supaya kecepatan gerak lid yang terlihat tidak berubah. Pada
+microstep 1/8, 1600 pulsa sama dengan satu putaran penuh motor,
+sedangkan pada 1/16 baru setengah putaran.
+
 ## Jawaban singkat
 
 Torsi stepper **tidak bisa diatur dari firmware**. Torsi ditentukan
 oleh perangkat keras, bukan oleh program.
 
-Uji `Q` yang baru ditambahkan **mengukur** pada kecepatan berapa motor
-mulai kehilangan langkah. Uji itu tidak menambah tenaga.
+Uji `Q` yang ditambahkan **mengukur** pada kecepatan berapa motor mulai
+kehilangan langkah. Uji itu tidak menambah tenaga.
 
 ## Kenapa torsi tidak bisa diatur dari firmware
 
@@ -64,13 +87,64 @@ jadi menurunkan ke 8 atau 4 adalah pertukaran yang menguntungkan:
 resolusi yang tidak dipakai ditukar dengan torsi yang memang
 dibutuhkan.
 
+## Dua versi chip TB6600 yang beredar
+
+Modul TB6600 dijual dalam dua versi, dan keduanya punya tabel DIP
+switch yang berbeda. Periksa dulu yang mana milikmu.
+
+| Chip | Microstep maksimal | Cara mengenali |
+|---|---|---|
+| **TB6600HG** (asli Toshiba) | **hanya sampai 1/16** | ada pin menonjol keluar dari PCB, chip besar, heatsink bagus |
+| **TB67S109AFTG** ("upgrade") | sampai 1/32 | chip kecil, tidak ada pin menonjol |
+
+Ini penting: kalau modulnya memakai **TB6600HG asli**, setelan 1/32
+**tidak tersedia**. Tabel resmi menyebut kombinasi itu sebagai `NC`
+(not connected, tidak terdefinisi), jadi menyetelnya ke 1/32 bisa
+masuk mode yang tidak diharapkan.
+
+Kedua chip ini sama-sama tidak mengubah kesimpulan soal torsi:
+microstep tinggi tetap berarti torsi per langkah kecil.
+
+## Tabel DIP switch microstep
+
+Nomor switch di modul adalah **SW1, SW2, SW3** untuk microstep.
+
+| Microstep | Pulsa/putaran | SW1 | SW2 | SW3 | Torsi per langkah |
+|---|---|---|---|---|---|
+| 1/1 | 200 | ON | ON | OFF | 100,00 % |
+| 1/2 | 400 | ON | OFF | ON | 70,71 % |
+| 1/4 | 800 | ON | OFF | OFF | 38,27 % |
+| **1/8** | **1600** | **OFF** | **ON** | **OFF** | **19,51 %** |
+| 1/16 | 3200 | OFF | OFF | ON | 9,80 % |
+| 1/32 | 6400 | OFF | OFF | OFF | 4,91 % |
+
+## Tabel DIP switch arus
+
+Nomor switch di modul adalah **SW4, SW5, SW6** untuk arus.
+
+| Arus | Puncak | SW4 | SW5 | SW6 |
+|---|---|---|---|---|
+| 0,5 A | 0,7 A | ON | ON | ON |
+| 1,0 A | 1,2 A | ON | OFF | ON |
+| 1,5 A | 1,7 A | ON | ON | OFF |
+| **2,0 A** | **2,2 A** | **ON** | **OFF** | **OFF** |
+| 2,5 A | 2,7 A | OFF | ON | ON |
+| 2,8 A | 2,9 A | OFF | OFF | ON |
+| 3,0 A | 3,2 A | OFF | ON | OFF |
+| 3,5 A | 4,0 A | OFF | OFF | OFF |
+
+**Peringatan:** motor NEMA 17 umumnya dinilai 1,5 sampai 2,0 A. Melebihi
+itu membuat motor panas berlebih dan bisa merusak isolasi kumparan.
+Kalau motor menjadi sangat panas setelah beberapa menit, turunkan satu
+tingkat. **Selalu matikan daya sebelum mengubah DIP switch.**
+
 ## Urutan perbaikan kalau torsi kurang
 
 | Urutan | Tindakan | Perkiraan manfaat |
 |---|---|---|
-| **1** | Naikkan arus TB6600 lewat SW1-SW3 ke 1.5 sampai 2.0 A | **Terbesar dan paling murah** |
-| 2 | Turunkan microstep dari 16 ke 8 | Besar |
-| 3 | Naikkan tegangan suplai motor ke 24 V | Sedang |
+| **1** | Naikkan arus TB6600 lewat SW4-SW6 ke 2,0 A | **Terbesar dan paling murah** |
+| 2 | Turunkan microstep dari 1/16 ke 1/8 | Dua kali lipat torsi per langkah |
+| 3 | Naikkan tegangan suplai motor ke 24 V | Sedang, terutama di kecepatan tinggi |
 | 4 | Turunkan kecepatan gerak | Kecil |
 
 ## Kalau mengubah microstep, firmware wajib ikut diubah

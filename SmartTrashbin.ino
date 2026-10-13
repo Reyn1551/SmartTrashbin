@@ -153,9 +153,41 @@ void addLogf(const char* fmt, ...) {
 }
 
 // ==================== KONSTANTA STEPPER ====================
-
-const float STEPS_PER_REV = 3200.0;
-const float STEPS_PER_DEG = STEPS_PER_REV / 360.0;   // 8.8889
+//
+//  !!! JANGAN UBAH ANGKA DI BAWAH TANPA MENYAMAKAN DIP SWITCH !!!
+//
+//  Nilai ini HARUS cocok dengan setelan microstep di modul TB6600.
+//  Kalau tidak cocok, semua sudut jadi salah tanpa peringatan apa pun:
+//  firmware tetap melaporkan "90 derajat" padahal lid bergerak 45 atau
+//  180 derajat.
+//
+//  Cara menghitung:
+//      pulsa per putaran = 200 x pembagi microstep
+//      STEPS_PER_REV     = pulsa per putaran
+//      STEPS_PER_DEG     = STEPS_PER_REV / 360
+//
+//  Tabel lengkap, pakai yang sesuai DIP switch SW1/SW2/SW3:
+//
+//   setelan    mikro   pulsa/putaran   STEPS_PER_REV   STEPS_PER_DEG
+//   ON  ON  OFF  1/1        200            200.0           0.5556
+//   ON  OFF ON   1/2        400            400.0           1.1111
+//   ON  OFF OFF  1/4        800            800.0           2.2222
+//   OFF ON  OFF  1/8       1600           1600.0           4.4444  <-- SEKARANG
+//   OFF OFF ON   1/16      3200           3200.0           8.8889
+//   OFF OFF OFF  1/32      6400           6400.0          17.7778
+//
+//  Microstep sekarang 1/8, bukan 1/16. Alasannya torsi: pada microstep
+//  1/16 torsi per langkah hanya 9,80 persen torsi holding, sementara
+//  detent torque motor sendiri 5 sampai 20 persen. Jadi sebagian
+//  perintah langkah tidak menghasilkan gerakan sama sekali. Pada
+//  microstep 1/8 torsi per langkah naik ke 19,51 persen, dua kali
+//  lipat. Ini penting karena lid ini menggerakkan sekitar 20 gear
+//  sekaligus, jadi bebannya berat.
+//
+//  Sumber angka torsi: Faulhaber Application Note 015, lihat
+//  docs/MENGATUR-TORSI-STEPPER.md
+const float STEPS_PER_REV = 1600.0;
+const float STEPS_PER_DEG = STEPS_PER_REV / 360.0;   // 4.4444
 
 // ------------------------------------------------------------
 //  SUDUT LID GLOBAL
@@ -234,10 +266,18 @@ struct ProfilKecepatan {
   uint8_t     pwmRoda;
 };
 
+// Nilai stepSps sudah disesuaikan untuk MICROSTEP 1/8, bukan 1/16.
+//
+// Sebelumnya pada microstep 1/16, 1600 step per detik berarti 0,5
+// putaran per detik pada motor. Setelah turun ke 1/8, angka yang sama
+// hanya berarti 1 putaran per detik, jadi lid bergerak DUA KALI LEBIH
+// CEPAT. Nilainya dibagi dua supaya kecepatan gerak lid tidak berubah
+// dari yang sudah kamu rasakan dan setujui.
+//           nama        step/s  PWM
 const ProfilKecepatan PROFIL[3] = {
-  { "SLOW",    400.0,  110 },
-  { "MEDIUM",  900.0,  165 },
-  { "FAST",   1600.0,  220 }
+  { "SLOW",    200.0,   45 },
+  { "MEDIUM",  450.0,  110 },
+  { "FAST",    800.0,  200 }
 };
 
 uint8_t profilAktif = PROFIL_MEDIUM;
@@ -813,6 +853,19 @@ void markMoveEndTimed(uint32_t steps, float speed) {
 //
 //  Sekarang panjang ramp proporsional: kecepatan x 0.5, dibatasi
 //  antara RAMP_MIN_STEPS dan RAMP_MAX_STEPS.
+//
+//  CATATAN UNTUK MICROSTEP 1/8:
+//  Angka di bawah ini disesuaikan saat firmware masih memakai
+//  microstep 1/16, dan pada dasarnya tidak perlu diubah, karena
+//  panjang ramp diukur dalam JUMLAH LANGKAH, bukan dalam putaran.
+//  Yang berubah hanyalah berapa derajat yang ditempuh tiap langkah.
+//
+//  Tetapi ada satu hal yang perlu disadari: pada microstep 1/8, satu
+//  langkah sekarang menempuh sudut dua kali lebih besar. Jadi ramp
+//  yang sama panjangnya kini mencakup sudut dua kali lebih lebar.
+//  Untuk beban berat ini justru menguntungkan, karena akselerasi jadi
+//  lebih landai dan motor lebih kecil kemungkinan kehilangan langkah
+//  di awal gerakan.
 #define RAMP_MIN_STEPS    150.0f   // ramp terpendek
 #define RAMP_MAX_STEPS    800.0f   // ramp terpanjang
 
@@ -3526,7 +3579,7 @@ function perbaruiPresisi(s){
   const uji   = s.presisiUji   || 0;
   const gagal = s.presisiGagal || 0;
   const maks  = s.presisiMaks  || 0;
-  const spd   = s.stepsPerDeg || 8.8889;
+  const spd   = s.stepsPerDeg || 4.4444;
 
   document.getElementById('preUji').textContent   = uji;
   document.getElementById('preGagal').textContent = gagal;
@@ -3865,6 +3918,15 @@ border:1px solid var(--bd)}
     <span class="label">Status</span>
     <span class="nilai" id="valStatus">-</span>
   </div>
+
+  <!-- Pengingat setelan microstep. Kalau DIP switch TB6600 diubah
+       tanpa mengubah firmware, semua sudut jadi salah, jadi nilai
+       yang berlaku ditampilkan di sini supaya mudah dicocokkan. -->
+  <div class="row">
+    <span class="label">Microstep firmware
+      <span class="hint">harus sama dengan DIP switch SW1-SW3</span></span>
+    <span class="nilai" id="valMicro">-</span>
+  </div>
 </div>
 
 <div class="kaki">
@@ -3947,12 +4009,18 @@ function tandai(id, aktif){
 }
 
 var KET = [
-  'Paling halus. Kecepatan tutup rendah sehingga hampir tidak mungkin kehilangan langkah. Cocok untuk gerakan yang harus mulus betul dan untuk menghemat baterai.',
-  'Seimbang. Ini pilihan sehari-hari yang aman untuk sebagian besar kondisi.',
-  'Paling cepat. Enak dipakai kalau arus TB6600 sudah benar dan tutupnya ringan. Kalau tutup mulai berhenti tidak tepat, turunkan ke MEDIUM.'
+  'Paling halus dan paling kuat. Kecepatan tutup rendah, jadi torsi yang tersedia paling besar. Ini pilihan terbaik untuk mekanisme gear yang berat, dan untuk menghemat baterai.',
+  'Seimbang. Cocok dipakai sehari-hari setelah mekanisme terbukti lancar pada SLOW.',
+  'Paling cepat. Pakai hanya kalau mekanisme sudah terbukti tidak pernah kehilangan langkah. Pada beban gear yang berat, kecepatan tinggi mengurangi torsi yang tersedia.'
 ];
 
-var TUTUP_MS = [ 'sekitar 2.3 detik', 'sekitar 1.1 detik', 'sekitar 0.9 detik' ];
+/* Kecepatan gerak lid sudah diperhitungkan untuk microstep 1/8.
+   Pada microstep 1/8, 1600 pulsa = satu putaran penuh motor, jadi
+   angka step per detik di sini separuh dari nilai lama, tetapi
+   kecepatan lid yang terlihat tetap sama. */
+var TUTUP_MS = [ 'paling halus, torsi terbesar',
+                 'seimbang',
+                 'paling cepat' ];
 var RODA_KET = [ 'pelan', 'sedang', 'kencang' ];
 
 /* ---------- BELOK DI TEMPAT ---------- */
@@ -4074,6 +4142,21 @@ function muat(){
 
       if (typeof s.pwmKiri === 'number'){
         $('valAkhir').textContent = s.pwmKiri + ' / ' + s.pwmKanan;
+      }
+
+      /* Tampilkan setelan microstep yang dipakai firmware. Cocokkan
+         dengan DIP switch SW1-SW3 di modul TB6600. */
+      if (typeof s.stepsPerDeg === 'number'){
+        var bagi;
+        if (s.stepsPerDeg < 0.8)      bagi = '1/1';
+        else if (s.stepsPerDeg < 1.8) bagi = '1/2';
+        else if (s.stepsPerDeg < 3.4) bagi = '1/4';
+        else if (s.stepsPerDeg < 6.6) bagi = '1/8';
+        else if (s.stepsPerDeg < 13)  bagi = '1/16';
+        else                          bagi = '1/32';
+
+        $('valMicro').textContent = bagi + ' (' +
+          Math.round(s.stepsPerDeg * 360) + ' pulsa/putaran)';
       }
 
       if (document.activeElement !== slider){
