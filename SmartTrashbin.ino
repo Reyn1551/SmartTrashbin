@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ============================================================
  *  SMART TRASHBIN — ESP32 WIFI AP + BLE
  *  Motor DC (roda) + 2x Stepper TB6600 (lid)
@@ -202,12 +202,49 @@ const float LID_MAX_DEG = LID_ANGLE_MAX;
 // atau gesekan, turunkan lewat halaman /debug (tombol K900 / K600)
 // atau kirim perintah K600. Kalau lid berhenti kurang dari 90 derajat,
 // itu tanda kehilangan langkah -> turunkan kecepatan.
-const float STEP_SPEED_FAST = 1600.0;   // kecepatan default (teruji halus)
-const float STEP_SPEED_SLOW = 600.0;    // untuk gerak halus / uji coba
+// ------------------------------------------------------------
+//  PROFIL KECEPATAN: SLOW / MEDIUM / FAST
+// ------------------------------------------------------------
+//  Satu tombol di controller memilih profil, dan SATU profil mengatur
+//  dua hal sekaligus: kecepatan putar roda (PWM) dan kecepatan gerak
+//  tutup (step per detik). Ini disengaja, supaya "slow" berarti slow
+//  untuk seluruh robot, bukan hanya rodanya.
+//
+//  SLOW   : paling pelan dan paling halus. Kecepatan tutupnya sengaja
+//           jauh lebih rendah supaya tidak ada kemungkinan kehilangan
+//           langkah. Ini pilihan untuk gerakan yang harus mulus betul,
+//           dan untuk menghemat baterai.
+//  MEDIUM : seimbang, dipakai sehari-hari.
+//  FAST   : paling cepat, tapi paling berisiko kehilangan langkah kalau
+//           arus TB6600 kurang atau beban tutup berat.
+//
+//  Nilai tutup berhenti di 900 step per detik karena pengujian
+//  menunjukkan di atas itu mulai ada tanda kehilangan langkah pada
+//  beban ringan. Roda boleh lebih cepat karena motor DC tidak punya
+//  masalah sinkronisasi.
 
-// Kecepatan aktif, bisa diubah dari HP/serial dengan perintah 'K'
-// Contoh: K300 = 300 step/detik. Berguna untuk tuning anti-getar.
-float stepSpeedActive = STEP_SPEED_FAST;
+#define PROFIL_SLOW    0
+#define PROFIL_MEDIUM  1
+#define PROFIL_FAST    2
+
+//            nama        step/s  PWM
+struct ProfilKecepatan {
+  const char* nama;
+  float       stepSps;
+  uint8_t     pwmRoda;
+};
+
+const ProfilKecepatan PROFIL[3] = {
+  { "SLOW",    400.0,  110 },
+  { "MEDIUM",  900.0,  165 },
+  { "FAST",   1600.0,  220 }
+};
+
+uint8_t profilAktif = PROFIL_MEDIUM;
+
+// Kecepatan stepper yang sedang berlaku, diubah dari HP/serial dengan
+// perintah 'K'. Nilai ini selalu diisi ulang saat profil berganti.
+float stepSpeedActive = PROFIL[PROFIL_MEDIUM].stepSps;
 
 // ============================================================
 //  POLARITAS SINYAL KE TB6600  *** BACA INI SEBELUM MENGUBAH ***
@@ -1451,6 +1488,55 @@ void lidBothToDeg(float deg, float speed) {
   stepperMoveToDeg(stLidRight, deg, speed);
 }
 
+// Terapkan profil kecepatan ke seluruh robot.
+//
+// Dipanggil saat pengguna menekan tombol SLOW/MEDIUM/FAST, dan saat
+// robot menyala untuk memulihkan pilihan terakhir. Kalau `simpan`
+// bernilai true, pilihannya ditulis ke flash supaya tidak hilang.
+void simpanProfil();
+void pilihProfil(uint8_t p, bool simpan) {
+  if (p > 2) p = PROFIL_MEDIUM;
+  profilAktif = p;
+
+  // Kecepatan tutup mengikuti profil
+  stepSpeedActive = PROFIL[p].stepSps;
+
+  // Kecepatan roda juga mengikuti, supaya "slow" berarti slow
+  // untuk seluruh robot, bukan hanya tutupnya.
+  speedPWM = PROFIL[p].pwmRoda;
+
+  // Kalau roda sedang berjalan, kecepatan baru langsung dipakai.
+  if (moveMode != MOVE_STOP) motorApply();
+
+  addLogf("[PROFIL] %s - tutup %.0f step/s, roda PWM %d",
+          PROFIL[p].nama, stepSpeedActive, speedPWM);
+
+  if (simpan) simpanProfil();
+}
+
+// Simpan pilihan profil ke flash.
+void simpanProfil() {
+  Preferences p;
+  if (!p.begin("trashbin", false)) return;
+  p.putUChar("profil", profilAktif);
+  p.end();
+}
+
+// Muat pilihan profil dari flash saat robot menyala.
+void muatProfil() {
+  Preferences p;
+  if (!p.begin("trashbin", true)) {
+    pilihProfil(PROFIL_MEDIUM, false);
+    return;
+  }
+
+  uint8_t v = p.getUChar("profil", PROFIL_MEDIUM);
+  p.end();
+
+  if (v > 2) v = PROFIL_MEDIUM;
+  pilihProfil(v, false);
+}
+
 // ------------------------------------------------------------
 //  SIMPAN / MUAT SUDUT GLOBAL KE FLASH (NVS)
 // ------------------------------------------------------------
@@ -1509,6 +1595,38 @@ void executeCommand(char cmd, const String &arg) {
     case 'L': moveMode = MOVE_LEFT;  motorApply(); break;
     case 'R': moveMode = MOVE_RIGHT; motorApply(); break;
     case 'P': moveMode = MOVE_STOP;  motorStop();  break;
+
+    // ============================================================
+    //  'N' = PILIH PROFIL KECEPATAN  (SLOW / MEDIUM / FAST)
+    // ============================================================
+    //  Format:  N<0|1|2>   atau   N<slow|medium|fast>
+    //    N0 / NSLOW    -> profil SLOW
+    //    N1 / NMEDIUM  -> profil MEDIUM
+    //    N2 / NFAST    -> profil FAST
+    //
+    //  Satu profil mengatur kecepatan roda DAN kecepatan tutup sekaligus,
+    //  supaya "slow" berlaku untuk seluruh robot.
+    //  Pilihan ini disimpan di flash.
+    case 'N': {
+      String a = arg;
+      a.toUpperCase();
+      a.trim();
+
+      int p = -1;
+
+      if (a.startsWith("SLOW"))        p = PROFIL_SLOW;
+      else if (a.startsWith("MEDIUM")) p = PROFIL_MEDIUM;
+      else if (a.startsWith("FAST"))   p = PROFIL_FAST;
+      else if (a.length() > 0)         p = a.toInt();
+
+      if (p < 0 || p > 2) {
+        addLog("[MOTOR] Profil harus SLOW, MEDIUM, FAST, atau 0-2");
+        break;
+      }
+
+      pilihProfil((uint8_t)p, true);
+      break;
+    }
 
     case 'V': {
       if (arg.length() > 0) {
@@ -1959,6 +2077,9 @@ void handleDebugJson() {
       "\"presisiMaks\":%ld,"
       "\"balikL\":%d,"
       "\"balikR\":%d,"
+      "\"profil\":%d,"
+      "\"profilNama\":\"%s\","
+      "\"sp\":%d,"
       "\"moveMode\":%d,"
       "\"pwm\":%d,"
       "\"timeoutS\":%lu,"
@@ -2016,6 +2137,9 @@ void handleDebugJson() {
     (long)gPresisiMaksSelisih,
     motorBalikKiri  ? 1 : 0,
     motorBalikKanan ? 1 : 0,
+    (int)profilAktif,
+    PROFIL[profilAktif].nama,
+    (int)stepSpeedActive,
     (int)moveMode,
     (int)speedPWM,
     CMD_TIMEOUT_MS / 1000,
@@ -2434,6 +2558,10 @@ overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0}
 </div>
 
 <div class="card"><h2>Motor Penggerak</h2>
+  <p style="font-size:11.5px;color:var(--dim);margin:0 0 10px">
+  Untuk mengubah setelan robot, buka <b><a href="/setting"
+  target="_blank" rel="noopener" style="color:var(--acc)">halaman Setelan</a></b>.
+  Halaman ini untuk diagnosa, bukan untuk mengatur.</p>
   <div class="row"><span class="k">Status roda</span>
     <b id="mStatus">-</b></div>
   <div class="row"><span class="k">PWM</span>
@@ -2910,6 +3038,335 @@ window.addEventListener('pointerup', function(){
 </script>
 </body></html>)rawliteral";
 
+// ============================================================
+//  HALAMAN /setting  -  DASHBOARD PENYETELAN
+// ============================================================
+//  Halaman ini khusus untuk MENGUBAH setelan robot, bukan untuk
+//  diagnosa. Isinya sengaja dibuat sesederhana mungkin: setiap setelan
+//  punya satu baris, penjelasan singkat, dan tombol yang jelas.
+//
+//  Dibuka lewat /setting, dan ditautkan dari /debug supaya mudah
+//  ditemukan. Tidak ada tombol di sini yang langsung menggerakkan
+//  motor, jadi halaman ini aman dibuka kapan saja tanpa mengubah
+//  posisi robot.
+const char SETTING_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+<html lang="id"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Setelan SmartTrashbin</title>
+<style>
+:root{--bg:#0c1015;--pan:#141a22;--fg:#e6edf3;--dim:#8b98a8;--acc:#4ea8ff;
+--bd:#212c38;--ok:#4ad07a;--warn:#ffc857;--er:#ff6b6b}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+padding:14px 14px 40px;max-width:620px;margin:0 auto}
+h1{font-size:19px;margin:0 0 3px}
+.sub{color:var(--dim);font-size:12.5px;margin-bottom:16px}
+.card{background:var(--pan);border:1px solid var(--bd);border-radius:11px;
+padding:14px;margin-bottom:12px}
+.card h2{font-size:11.5px;margin:0 0 11px;color:var(--dim);
+text-transform:uppercase;letter-spacing:1px;font-weight:600}
+.ket{color:var(--dim);font-size:12px;margin:0 0 11px}
+.row{display:flex;justify-content:space-between;align-items:center;
+gap:10px;padding:7px 0;border-bottom:1px solid #1b232d}
+.row:last-child{border:0}
+.row .label{font-size:13.5px}
+.row .hint{color:var(--dim);font-size:11.5px;display:block;margin-top:2px}
+.nilai{font-weight:700;color:var(--acc);font-size:14px}
+.pil{display:flex;gap:7px;flex-wrap:wrap}
+button{font:inherit;font-size:13px;padding:8px 13px;border-radius:8px;
+background:#1e2833;color:var(--fg);border:1px solid var(--bd);
+cursor:pointer;touch-action:manipulation}
+button:active{background:var(--acc);color:#04121f}
+button.pilih{background:#2d4a6b;border-color:#4a7ab5;color:#cfe3ff;
+font-weight:700}
+input[type=number]{font:inherit;width:82px;padding:7px 9px;border-radius:8px;
+background:#0e141b;color:var(--fg);border:1px solid var(--bd);text-align:center}
+input[type=range]{width:100%;margin:7px 0 0;accent-color:var(--acc)}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.er{color:var(--er)}
+.dimc{color:var(--dim)}
+.tab{display:flex;gap:7px;margin-bottom:15px}
+.tab a{flex:1;text-align:center;padding:9px;border-radius:9px;font-size:13px;
+background:#1a222c;color:var(--dim);text-decoration:none;
+border:1px solid var(--bd)}
+.tab a.aktif{background:var(--acc);color:#04121f;font-weight:700}
+.kaki{color:var(--dim);font-size:11.5px;text-align:center;margin-top:18px}
+</style></head><body>
+
+<h1>Setelan</h1>
+<div class="sub">Atur robot tanpa harus menggerakkannya</div>
+
+<div class="tab">
+  <a href="/">Kontrol</a>
+  <a href="/setting" class="aktif">Setelan</a>
+  <a href="/debug">Diagnosa</a>
+</div>
+
+<!-- ============ KECEPATAN ============ -->
+<div class="card">
+  <h2>Kecepatan</h2>
+  <p class="ket">Satu pilihan mengatur roda dan tutup sekaligus.</p>
+
+  <div class="pil" id="profilPil">
+    <button onclick="setProfil(0)" id="pb0">SLOW</button>
+    <button onclick="setProfil(1)" id="pb1">MEDIUM</button>
+    <button onclick="setProfil(2)" id="pb2">FAST</button>
+  </div>
+
+  <div class="row" style="margin-top:11px">
+    <span class="label">Tutup bergerak<span class="hint" id="hintTutup">-</span></span>
+    <span class="nilai" id="valTutup">-</span>
+  </div>
+  <div class="row">
+    <span class="label">Roda berputar<span class="hint" id="hintRoda">-</span></span>
+    <span class="nilai" id="valRoda">-</span>
+  </div>
+
+  <p class="ket" style="margin:11px 0 0" id="ketProfil">-</p>
+</div>
+
+<!-- ============ BUKAAN ============ -->
+<div class="card">
+  <h2>Bukaan Tutup</h2>
+  <p class="ket">Sudut ini dipakai setiap kali tutup dibuka.</p>
+
+  <div class="pil" id="sudutPil">
+    <button onclick="setSudut(30)">30&deg;</button>
+    <button onclick="setSudut(45)">45&deg;</button>
+    <button onclick="setSudut(60)">60&deg;</button>
+    <button onclick="setSudut(90)">90&deg;</button>
+    <button onclick="setSudut(120)">120&deg;</button>
+  </div>
+
+  <div class="row" style="margin-top:11px">
+    <span class="label">Sudut lain</span>
+    <span>
+      <input type="number" id="sudutKustom" min="1" max="120" step="1" value="90">
+      <button onclick="pakaiSudutKustom()">Simpan</button>
+    </span>
+  </div>
+
+  <div class="row">
+    <span class="label">Sudut aktif</span>
+    <span class="nilai" id="valSudut">-</span>
+  </div>
+</div>
+
+<!-- ============ ARAH MOTOR ============ -->
+<div class="card">
+  <h2>Arah Motor Roda</h2>
+  <p class="ket">Kalau robot bergerak terbalik dari tombolnya, balik
+  arah di sini. Tidak perlu membongkar kabel.</p>
+
+  <div class="row">
+    <span class="label">Motor kiri</span>
+    <span>
+      <button onclick="setArah('L',1)" id="bl1">Balik</button>
+      <button onclick="setArah('L',0)" id="bl0">Normal</button>
+    </span>
+  </div>
+  <div class="row">
+    <span class="label">Motor kanan</span>
+    <span>
+      <button onclick="setArah('R',1)" id="br1">Balik</button>
+      <button onclick="setArah('R',0)" id="br0">Normal</button>
+    </span>
+  </div>
+
+  <div class="pil" style="margin-top:11px">
+    <button onclick="c('F')" style="flex:1">Uji MAJU</button>
+    <button onclick="c('P')" style="flex:1">STOP</button>
+  </div>
+  <p class="ket" style="margin:9px 0 0">Tekan Uji MAJU sebentar saja
+  untuk memastikan arahnya sudah benar.</p>
+</div>
+
+<!-- ============ MODE TAHAN ============ -->
+<div class="card">
+  <h2>Mode Tahan Tutup</h2>
+  <p class="ket">Saat aktif, motor tutup terus diberi arus sehingga
+  tutup tidak turun sendiri karena beratnya. Motor akan terasa hangat,
+  dan baterai lebih cepat habis.</p>
+
+  <div class="row">
+    <span class="label">Tahan tutup</span>
+    <span>
+      <button onclick="setTahan(1)" id="bh1">Aktif</button>
+      <button onclick="setTahan(0)" id="bh0">Mati</button>
+    </span>
+  </div>
+</div>
+
+<!-- ============ SISTEM ============ -->
+<div class="card">
+  <h2>Sistem</h2>
+  <div class="row"><span class="label">Kecepatan roda langsung</span>
+    <span class="nilai"><span id="valPwm">-</span></span></div>
+  <input type="range" id="pwm" min="0" max="255" value="165">
+  <p class="ket" style="margin:8px 0 0">Geser untuk mengubah kecepatan
+  roda saja, tanpa mengubah kecepatan tutup.</p>
+
+  <div class="row" style="margin-top:12px">
+    <span class="label">Nolkan posisi tutup</span>
+    <button onclick="c('A')">Kalibrasi 0&deg;</button>
+  </div>
+
+  <div class="row">
+    <span class="label">Jalankan ulang robot</span>
+    <button onclick="reboot()">Muat Ulang</button>
+  </div>
+
+  <div class="row">
+    <span class="label">Status</span>
+    <span class="nilai" id="valStatus">-</span>
+  </div>
+</div>
+
+<div class="kaki">
+  Setelan tersimpan di memori robot dan tetap ada setelah dimatikan.<br>
+  <span id="pesan">-</span>
+</div>
+
+<script>
+var $ = function(i){ return document.getElementById(i); };
+var bawaTimer = null;
+
+function pesan(t, jenis){
+  var el = $('pesan');
+  el.textContent = t;
+  el.className = jenis || 'dimc';
+  if (bawaTimer) clearTimeout(bawaTimer);
+  bawaTimer = setTimeout(function(){ el.textContent = '-';
+    el.className = 'dimc'; }, 2500);
+}
+
+/* Kirim perintah ke firmware */
+function c(v){
+  fetch('/cmd?val=' + encodeURIComponent(v), {cache:'no-store'})
+    .then(function(r){ if (!r.ok) throw 0; return r.text(); })
+    .then(function(){ muat(); })
+    .catch(function(){ pesan('Robot tidak merespons', 'er'); });
+}
+
+/* Ketiga fungsi di bawah ini mengubah setelan, jadi selalu beri tahu
+   pengguna bahwa setelannya sudah tersimpan. */
+function setProfil(p){
+  c('N' + p);
+  var n = ['SLOW', 'MEDIUM', 'FAST'][p] || '?';
+  pesan('Kecepatan: ' + n, 'ok');
+}
+
+function setSudut(d){
+  d = Math.max(1, Math.min(120, d));
+  c('W' + d);
+  pesan('Sudut bukaan: ' + d + '\u00B0', 'ok');
+}
+
+function pakaiSudutKustom(){
+  var d = parseFloat($('sudutKustom').value);
+  if (isNaN(d)) { pesan('Angka tidak valid', 'er'); return; }
+  d = Math.max(1, Math.min(120, d));
+  $('sudutKustom').value = d;
+  setSudut(d);
+}
+
+function setArah(sisi, balik){
+  c('Y' + sisi + balik);
+  pesan('Motor ' + (sisi === 'L' ? 'kiri' : 'kanan') + ': ' +
+        (balik ? 'DIBALIK' : 'normal'), 'ok');
+}
+
+function setTahan(on){
+  c('H' + on);
+  pesan('Mode tahan: ' + (on ? 'AKTIF' : 'mati'), 'ok');
+}
+
+function reboot(){
+  if (!confirm('Jalankan ulang robot? Posisi tutup akan dianggap 0 derajat.')) return;
+  fetch('/debug/reset', {cache:'no-store'}).catch(function(){});
+  pesan('Robot dijalankan ulang', 'ok');
+}
+
+/* Slider PWM mengubah kecepatan roda saja */
+var slider = $('pwm');
+slider.addEventListener('input', function(){ $('valPwm').textContent = slider.value; });
+slider.addEventListener('change', function(){ c('V' + slider.value); });
+$('valPwm').textContent = slider.value;
+
+/* Tandai tombol yang sedang aktif supaya pengguna tahu setelan mana
+   yang berlaku sekarang. */
+function tandai(id, aktif){
+  var el = $(id);
+  if (!el) return;
+  el.className = aktif ? 'pilih' : '';
+}
+
+var KET = [
+  'Paling halus. Kecepatan tutup rendah sehingga hampir tidak mungkin kehilangan langkah. Cocok untuk gerakan yang harus mulus betul dan untuk menghemat baterai.',
+  'Seimbang. Ini pilihan sehari-hari yang aman untuk sebagian besar kondisi.',
+  'Paling cepat. Enak dipakai kalau arus TB6600 sudah benar dan tutupnya ringan. Kalau tutup mulai berhenti tidak tepat, turunkan ke MEDIUM.'
+];
+
+var TUTUP_MS = [ 'sekitar 2.3 detik', 'sekitar 1.1 detik', 'sekitar 0.9 detik' ];
+var RODA_KET = [ 'pelan', 'sedang', 'kencang' ];
+
+function muat(){
+  fetch('/status', {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(s){
+      var p = (typeof s.profil === 'number') ? s.profil : 1;
+
+      for (var i = 0; i < 3; i++) tandai('pb' + i, i === p);
+
+      $('hintTutup').textContent = TUTUP_MS[p] || '';
+      $('hintRoda').textContent  = RODA_KET[p] || '';
+      $('ketProfil').textContent = KET[p] || '';
+
+      $('valTutup').textContent = (s.sp || 0) + ' step/detik';
+      $('valRoda').textContent  = (s.pwm || 0) + ' PWM';
+
+      if (typeof s.lidAngle === 'number'){
+        var d = Math.round(s.lidAngle);
+        $('valSudut').textContent = d + '\u00B0';
+        $('sudutKustom').value = d;
+        ['30','45','60','90','120'].forEach(function(v){
+          var btn = document.querySelector('#sudutPil button[onclick*="setSudut('+v+')"]');
+          if (btn) btn.className = (parseInt(v,10) === d) ? 'pilih' : '';
+        });
+      }
+
+      $('bl1').className = s.balikL ? 'pilih' : '';
+      $('bl0').className = s.balikL ? '' : 'pilih';
+      $('br1').className = s.balikR ? 'pilih' : '';
+      $('br0').className = s.balikR ? '' : 'pilih';
+
+      $('bh1').className = s.holdMode ? 'pilih' : '';
+      $('bh0').className = s.holdMode ? '' : 'pilih';
+
+      if (document.activeElement !== slider){
+        slider.value = s.pwm || 0;
+        $('valPwm').textContent = slider.value;
+      }
+
+      $('valStatus').textContent = 'terhubung';
+      $('valStatus').className = 'nilai ok';
+    })
+    .catch(function(){
+      $('valStatus').textContent = 'tidak terhubung';
+      $('valStatus').className = 'nilai er';
+    });
+}
+
+muat();
+setInterval(muat, 2000);
+</script>
+</body></html>)rawliteral";
+
+void handleSettingPage() {
+  server.send_P(200, "text/html", SETTING_HTML);
+}
+
 void handleDebugPage() {
   server.send_P(200, "text/html", DEBUG_HTML);
 }
@@ -3000,6 +3457,9 @@ void setup() {
   // tidak hilang saat ESP32 dimatikan.
   muatSudutGlobal();
 
+  // Pulihkan pilihan profil kecepatan terakhir (SLOW/MEDIUM/FAST).
+  muatProfil();
+
   // Buang sampah di buffer serial. Kalau monitor/host sempat menumpuk
   // perintah lama, perintah itu akan langsung dieksekusi saat boot dan
   // bisa terlihat seperti robot bertingkah sendiri.
@@ -3039,6 +3499,7 @@ void setup() {
 
   // ---------- Web server ----------
   server.on("/",            handleRoot);
+  server.on("/setting",     handleSettingPage);
   server.on("/cmd",         handleCmd);
   server.on("/status",      handleStatus);
   server.on("/debug",       handleDebugPage);

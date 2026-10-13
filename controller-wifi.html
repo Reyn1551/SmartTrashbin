@@ -234,6 +234,38 @@
     text-transform: uppercase; color: var(--muted);
     margin-bottom: 6px;
   }
+
+  /* ---------- tombol pilih kecepatan ---------- */
+  /* Tiga tombol, bukan slider. Lebih mudah ditekan di HP dan tidak
+     bisa salah geser. Tombol yang aktif ditandai jelas. */
+  .profil { display: flex; gap: 6px; }
+  .profil .pbtn {
+    flex: 1; font: inherit; font-size: 11px; font-weight: 700;
+    letter-spacing: .06em; padding: 11px 4px;
+    border-radius: var(--r-md); cursor: pointer;
+    background: var(--panel-hi); color: var(--muted);
+    border: 1px solid var(--line);
+    transition: background 130ms, color 130ms, border-color 130ms;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+  }
+  .profil .pbtn.on {
+    background: var(--brand); color: var(--bg);
+    border-color: var(--brand);
+  }
+
+  /* ---------- tautan ke halaman lain ---------- */
+  .navbuka {
+    display: flex; gap: 8px; margin: 10px 0 0;
+  }
+  .navbuka a {
+    flex: 1; text-align: center; text-decoration: none;
+    font-size: 12px; font-weight: 600; letter-spacing: .04em;
+    padding: 10px; border-radius: var(--r-md);
+    background: var(--panel-hi); color: var(--muted);
+    border: 1px solid var(--line);
+  }
+  .navbuka a:active { background: var(--brand); color: var(--bg); }
   input[type=range] {
     -webkit-appearance: none; appearance: none;
     width: 100%; height: 34px; background: transparent; cursor: pointer;
@@ -368,12 +400,14 @@
       </div>
     </section>
 
-    <!-- SPEED — PWM roda -->
+    <!-- SPEED — profil kecepatan robot -->
     <section class="speed">
-      <div class="readout" id="pwm-out">140</div>
-      <div class="unit">PWM · Roda</div>
       <div class="cap">Kecepatan</div>
-      <input type="range" min="0" max="255" value="140" id="pwm" aria-label="Kecepatan motor roda">
+      <div class="profil" id="profil">
+        <button class="pbtn" data-profil="0">SLOW</button>
+        <button class="pbtn" data-profil="1">MEDIUM</button>
+        <button class="pbtn" data-profil="2">FAST</button>
+      </div>
     </section>
 
     <!-- LIDS — STEPPER -->
@@ -398,6 +432,14 @@
   </div>
 
   <div class="link" id="link"><i></i><span id="link-txt"></span></div>
+
+  <!-- Tautan ke halaman penyetelan. Sengaja dibuat sebagai tautan
+       biasa, bukan tombol yang mengirim perintah, supaya tidak ada
+       risiko tidak sengaja menggerakkan robot. -->
+  <div class="navbuka">
+    <a href="/setting" target="_blank" rel="noopener">Setelan</a>
+    <a href="/debug" target="_blank" rel="noopener">Diagnosa</a>
+  </div>
 
   <div id="connbar">
     <span class="dot"></span><span id="conn-txt">menyambung…</span>
@@ -450,9 +492,8 @@ function pollStatus() {
         paintLid('left',  s.ll > open * 0.5);
         paintLid('right', s.lr > open * 0.5);
       }
-      if (typeof s.sp === 'number' && document.activeElement !== slider) {
-        slider.value = s.sp;
-        onSlide(s.sp);
+      if (typeof s.profil === 'number' && s.profil !== PROFIL) {
+        paintProfil(s.profil);
       }
     })
     .catch(function () { markOnline(false); });
@@ -569,18 +610,35 @@ document.querySelectorAll('[data-tap]').forEach(function (b) {
 });
 
 /* ============================================================
-   SPEED — PWM roda
-   ============================================================ */
-const slider = document.getElementById('pwm');
-const out    = document.getElementById('pwm-out');
+   SPEED — profil kecepatan (SLOW / MEDIUM / FAST)
+   ============================================================
+   Satu tombol mengatur kecepatan roda DAN kecepatan gerak tutup
+   sekaligus, supaya "SLOW" berarti slow untuk seluruh robot.
 
-function onSlide(v) {
-  out.textContent = v;
-  slider.style.setProperty('--fill', (v / 255 * 100) + '%');
+   Firmware yang menyimpan pilihannya, jadi setelah halaman dimuat
+   ulang tampilan disinkronkan dari status robot, bukan dari nilai
+   bawaan di halaman ini.
+   ============================================================ */
+let PROFIL = 1;   /* 0 = SLOW, 1 = MEDIUM, 2 = FAST */
+
+function paintProfil(p) {
+  PROFIL = p;
+  document.querySelectorAll('#profil .pbtn').forEach(function (b) {
+    b.classList.toggle('on', Number(b.dataset.profil) === p);
+  });
 }
-slider.addEventListener('input', function () { onSlide(slider.value); });
-slider.addEventListener('change', function () { send('V' + slider.value); });
-onSlide(slider.value);
+
+document.querySelectorAll('#profil .pbtn').forEach(function (b) {
+  b.addEventListener('click', function () {
+    const p = Number(b.dataset.profil);
+    /* Ubah tampilan lebih dulu supaya terasa langsung merespons,
+       lalu kirim perintahnya ke robot. */
+    paintProfil(p);
+    send('N' + p);
+  });
+});
+
+paintProfil(PROFIL);
 
 /* ============================================================
    LID — stepper (KENDALI PER SISI)
