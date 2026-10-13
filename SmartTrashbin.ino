@@ -955,6 +955,252 @@ void stepperJog(Stepper &s, long steps, int forcedDir, float sps) {
   s.dir        = savedDir;
 }
 
+// ============================================================
+//  UJI TORSI DAN KECEPATAN MAKSIMAL  (SWEEP OTOMATIS)
+// ============================================================
+//
+//  LATAR BELAKANG: KENAPA TORSI TIDAK BISA DIATUR DARI FIRMWARE
+//
+//  Pertanyaan "apakah torsi stepper bisa diatur" jawabannya: BISA,
+//  tetapi BUKAN dari program ini. Torsi motor stepper ditentukan dua
+//  hal, dan keduanya perangkat keras:
+//
+//  1. ARUS YANG DISETEL DI TB6600 (paling menentukan).
+//     Arus ini diatur DIP switch SW1/SW2/SW3 di modul TB6600. Nilai
+//     yang tersedia biasanya 0.5 sampai 4.0 A. NEMA 17 umumnya butuh
+//     1.5 sampai 2.0 A. Selama arusnya terlalu kecil, motor akan
+//     kehilangan langkah atau tidak kuat mengangkat beban, DAN TIDAK
+//     ADA PERINTAH DARI ESP32 YANG BISA MENAMBAHNYA. Sinyal PUL dan
+//     DIR hanya menentukan kapan dan ke arah mana motor berputar,
+//     bukan seberapa kuat.
+//
+//  2. LEVEL MICROSTEP (DIP switch SW4/SW5/SW6).
+//     Ini berlawanan dengan intuisi, tetapi menaikkan microstep
+//     justru MENURUNKAN torsi per langkah. Menurut Faulhaber
+//     Application Note 015, torsi per microstep dibanding torsi
+//     holding penuh adalah:
+//
+//        microstep  1 -> 100.00 persen
+//        microstep  2 ->  70.71 persen
+//        microstep  4 ->  38.27 persen
+//        microstep  8 ->  19.51 persen
+//        microstep 16 ->   9.80 persen
+//
+//     Pada microstep 16, satu langkah hanya menghasilkan kurang dari
+//     10 persen torsi holding. Sementara itu detent torque motor
+//     sendiri 5 sampai 20 persen dari holding torque. Artinya torsi
+//     satu microstep seringkali TIDAK CUKUP untuk mengalahkan detent
+//     torque, sehingga sebagian perintah langkah tidak menghasilkan
+//     gerakan sama sekali.
+//
+//     Jadi untuk beban berat, microstep RENDAH memberi torsi lebih
+//     besar. Lid tong sampah tidak butuh resolusi 3200 pulsa per
+//     putaran, jadi menurunkan ke 8 atau 4 adalah pertukaran yang
+//     menguntungkan: resolusi yang tidak dipakai ditukar dengan
+//     torsi yang memang dibutuhkan.
+//
+//  KALAU TORSI KURANG, URUTAN YANG DISARANKAN:
+//     a. Naikkan arus TB6600 lewat SW1/SW2/SW3 ke 1.5 sampai 2.0 A.
+//        Ini perbaikan terbesar dan paling murah.
+//     b. Turunkan microstep dari 16 ke 8.
+//     c. Naikkan tegangan suplai motor ke 24 V kalau memungkinkan.
+//     d. Turunkan kecepatan gerak.
+//
+//  SETELAH MENGUBAH MICROSTEP, `STEPS_PER_DEG` DI FIRMWARE WAJIB
+//  IKUT DIUBAH. Kalau tidak, sudut yang diminta akan salah:
+//        microstep  4 -> 3600.0 / 360.0 = 10.0000
+//        microstep  8 -> 1600.0 / 360.0 =  4.4444
+//        microstep 16 -> 3200.0 / 360.0 =  8.8889  (nilai sekarang)
+//
+//  ------------------------------------------------------------
+//  ALAT UJI INI
+//  ------------------------------------------------------------
+//
+//  Karena torsi tidak bisa diubah dari firmware, yang bisa dilakukan
+//  adalah MENGUKUR pada kecepatan berapa motor mulai kehilangan
+//  langkah. Dari situ ketahuan batas aman, dan ketahuan juga apakah
+//  masalahnya di kecepatan atau memang di arus.
+//
+//  Uji ini menjalankan gerakan bolak-balik pada kecepatan yang naik
+//  bertahap, lalu melaporkan pada tahap berapa mulai meleset.
+
+// Hasil satu tahap uji
+struct HasilSweep {
+  float    sps;
+  uint32_t minta;
+  uint32_t dapat;
+  long     selisih;
+  uint32_t jitterMaks;
+  bool     meleset;
+};
+
+#define SWEEP_MAKS_TAHAP 12
+
+HasilSweep sweepHasil[SWEEP_MAKS_TAHAP];
+uint8_t    sweepJumlahTahap = 0;
+uint16_t   sweepTotalMeleset = 0;
+
+// Kecepatan tertinggi yang masih tepat, dikali 10 supaya bisa
+// dikirim sebagai bilangan bulat. -10 berarti belum ada yang aman.
+float sweepKecepatanAman = -1.0f;
+
+// Jalankan satu gerakan uji pada satu kecepatan, lalu hitung
+// selisih antara langkah yang diminta dan yang benar-benar keluar.
+void sweepSatuTahap(Stepper &s, float sps, long langkah) {
+  // Siapkan gerakan
+  s.dir          = +1;
+  s.targetStep   = s.currentStep + langkah;
+  s.speedTarget  = sps;
+  s.speedCurrent = 0;
+  s.pulseHigh    = false;
+  s.warmUp       = 2;
+
+  stepperEnable(s, true);
+  digitalWrite(s.pinDir, DIR_FOR_POS);
+  digitalWrite(s.pinPul, PULSE_OFF);
+  delayMicroseconds(20);
+
+  // Nolkan pelacak supaya angka yang dilaporkan hanya untuk tahap ini
+  gPeriodCount      = 0;
+  gPeriodSumUs      = 0;
+  gPeriodMaxUs      = 0;
+  gPeriodMinUs      = 0xFFFFFFFF;
+  gPeriodLastUs     = 0;
+  gLonjakCount      = 0;
+  gLonjakTerbesarUs = 0;
+
+  uint32_t awal = stepTotal;
+
+  s.lastPulseUs = micros();
+  s.moving      = true;
+
+  // Jalankan sampai selesai. Batas 5 detik mencegah robot menggantung
+  // kalau ada yang tidak beres.
+  unsigned long t0 = millis();
+  while (s.moving && (millis() - t0) < 5000UL) {
+    stepperTick(s, micros());
+  }
+
+  s.moving = false;
+  stepperRelease(s);
+
+  // Catat hasilnya
+  HasilSweep &h = sweepHasil[sweepJumlahTahap];
+  h.sps        = sps;
+  h.minta      = (uint32_t)langkah;
+  h.dapat      = stepTotal - awal;
+  h.selisih    = (long)h.dapat - langkah;
+  h.jitterMaks = gPeriodMaxUs;
+  h.meleset    = (h.selisih != 0);
+
+  if (h.meleset) {
+    sweepTotalMeleset++;
+    addLogf("[SWEEP] %.0f step/s MELESET %+ld langkah (minta %lu, dapat %lu)",
+            sps, h.selisih,
+            (unsigned long)h.minta, (unsigned long)h.dapat);
+  } else {
+    addLogf("[SWEEP] %.0f step/s TEPAT %lu langkah",
+            sps, (unsigned long)h.dapat);
+  }
+
+  sweepJumlahTahap++;
+
+  // Kembalikan ke posisi semula supaya lid tidak makin terbuka terus
+  s.targetStep = s.currentStep - langkah;
+  s.dir        = -1;
+  s.speedTarget  = sps;
+  s.speedCurrent = 0;
+  s.pulseHigh    = false;
+  s.warmUp       = 2;
+
+  stepperEnable(s, true);
+  digitalWrite(s.pinDir, DIR_FOR_NEG);
+  digitalWrite(s.pinPul, PULSE_OFF);
+  delayMicroseconds(20);
+
+  s.lastPulseUs = micros();
+  s.moving      = true;
+
+  t0 = millis();
+  while (s.moving && (millis() - t0) < 5000UL) {
+    stepperTick(s, micros());
+  }
+
+  s.moving = false;
+  stepperRelease(s);
+
+  // Jeda antar tahap supaya motor dan driver tidak kepanasan.
+  delay(300);
+}
+
+// Uji seluruh rentang kecepatan pada satu lid, dari lambat ke cepat.
+// Berhenti lebih awal kalau dua tahap berturut-turut sudah meleset,
+// supaya motor tidak dipaksa terus saat sudah jelas tidak kuat.
+void sweepKecepatan(Stepper &s, const char* nama) {
+  // Kecepatan uji, dari paling lambat ke paling cepat
+  const float daftar[] = { 200, 400, 600, 800, 1000,
+                           1200, 1400, 1600, 1800, 2000 };
+  const uint8_t jumlah = sizeof(daftar) / sizeof(daftar[0]);
+
+  // Panjang gerakan 800 langkah = 90 derajat. Cukup panjang supaya
+  // motor benar-benar mencapai kecepatan penuh, dan cukup pendek
+  // supaya banyak tahap bisa diuji tanpa lid membentur apa pun.
+  const long LANGKAH = 800;
+
+  sweepJumlahTahap  = 0;
+  sweepTotalMeleset = 0;
+
+  float speedSebelumnya = stepSpeedActive;
+
+  addLogf("[SWEEP] ===== MULAI ===== lid %s", nama);
+  addLogf("[SWEEP] %u tahap, %ld langkah tiap tahap (90 derajat)",
+          (unsigned)jumlah, LANGKAH);
+
+  uint8_t gagalBerturut = 0;
+
+  for (uint8_t i = 0; i < jumlah; i++) {
+    sweepSatuTahap(s, daftar[i], LANGKAH);
+
+    if (sweepHasil[sweepJumlahTahap - 1].meleset) {
+      gagalBerturut++;
+    } else {
+      gagalBerturut = 0;
+    }
+
+    // Dua tahap meleset berturut-turut = sudah lewat batasnya.
+    if (gagalBerturut >= 2) {
+      addLogf("[SWEEP] Dua tahap meleset berturut-turut, uji dihentikan di %.0f step/s",
+              daftar[i]);
+      break;
+    }
+  }
+
+  // Cari kecepatan tertinggi yang masih tepat
+  float aman = -1.0f;
+  for (uint8_t i = 0; i < sweepJumlahTahap; i++) {
+    if (!sweepHasil[i].meleset) aman = sweepHasil[i].sps;
+  }
+  sweepKecepatanAman = aman;
+
+  addLog("[SWEEP] ===== SELESAI =====");
+
+  if (aman > 0) {
+    addLogf("[SWEEP] Kecepatan aman tertinggi: %.0f step/s", aman);
+    addLogf("[SWEEP] Di atas itu mulai kehilangan langkah. Pakai %.0f step/s untuk %s.",
+            aman * 0.8f, nama);
+  } else {
+    addLog("[SWEEP] Bahkan 200 step/s sudah meleset.");
+    addLog("[SWEEP] Ini BUKAN masalah kecepatan. Periksa arus TB6600,");
+    addLog("[SWEEP] dan coba turunkan microstep dari 16 ke 8.");
+  }
+
+  addLogf("[SWEEP] Tahap diuji: %u, tahap meleset: %u",
+          sweepJumlahTahap, sweepTotalMeleset);
+
+  // Kembalikan kecepatan semula
+  stepSpeedActive = speedSebelumnya;
+}
+
 // Jalankan uji DIR: gerakkan maju sedikit, lalu mundur sedikit.
 // Kalau DIR bekerja, motor akan bergoyang bolak-balik di tempat.
 // Kalau tidak, motor akan jalan terus satu arah.
@@ -1762,6 +2008,36 @@ void executeCommand(char cmd, const String &arg) {
       break;
     }
 
+    // ============================================================
+    //  'Q' = UJI KECEPATAN BERTAHAP (SWEEP)
+    // ============================================================
+    //  Mencari pada kecepatan berapa motor mulai kehilangan langkah.
+    //
+    //    Q   atau QL  -> uji lid KIRI
+    //    QR           -> uji lid KANAN
+    //    QB           -> uji KEDUA lid
+    //
+    //  PENTING: torsi TIDAK BISA diubah dari firmware. Uji ini
+    //  mengukur batas kecepatan, bukan menambah tenaga. Untuk menambah
+    //  tenaga harus mengubah arus di DIP switch TB6600, lihat catatan
+    //  lengkap di atas fungsi sweepKecepatan().
+    case 'Q': {
+      String a = arg;
+      a.toUpperCase();
+
+      bool kiri  = (a.indexOf('L') >= 0) || (a.indexOf('R') < 0);
+      bool kanan = (a.indexOf('R') >= 0) || (a.indexOf('L') < 0);
+
+      addLog("[SWEEP] Mulai... motor akan bergerak bolak-balik.");
+      addLog("[SWEEP] Jangan matikan robot selama uji berjalan.");
+
+      if (kiri)  sweepKecepatan(stLidLeft,  "KIRI");
+      if (kanan) sweepKecepatan(stLidRight, "KANAN");
+
+      addLog("[SWEEP] Selesai. Lihat hasilnya di log di atas.");
+      break;
+    }
+
     case 'V': {
       if (arg.length() > 0) {
         int sp = arg.toInt();
@@ -2294,6 +2570,9 @@ void handleDebugJson() {
       "\"kompKiri\":%d,"
       "\"kompKanan\":%d,"
       "\"timeoutS\":%lu,"
+      "\"sweepN\":%u,"
+      "\"sweepGagal\":%u,"
+      "\"sweepAman\":%d,"
       "\"stepsPerDeg\":%.4f"
     "}",
     (unsigned long)(millis() / 1000),
@@ -2359,6 +2638,9 @@ void handleDebugJson() {
     (int)pwmKompensasiKiri,
     (int)pwmKompensasiKanan,
     CMD_TIMEOUT_MS / 1000,
+    (unsigned)sweepJumlahTahap,
+    (unsigned)sweepTotalMeleset,
+    (int)(sweepKecepatanAman * 10.0f),
     STEPS_PER_DEG);
 
   server.send(200, "application/json", buf);
@@ -2811,6 +3093,29 @@ overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0}
   lagi untuk memastikan. Setelan ini tersimpan di memori.</p>
 </div>
 
+<div class="card"><h2>Uji Torsi &amp; Kecepatan Maksimal</h2>
+  <p style="font-size:11.5px;color:var(--dim);margin:0 0 10px">
+  Mencari pada kecepatan berapa motor mulai kehilangan langkah.
+  Motor akan bergerak bolak-balik sekitar 30 detik.</p>
+
+  <div class="row"><span class="k">Jalankan uji</span>
+    <span>
+      <button onclick="c('QL')">LID KIRI</button>
+      <button onclick="c('QR')">LID KANAN</button>
+      <button onclick="c('QB')">KEDUA</button>
+    </span>
+  </div>
+
+  <div id="sweepHasil" style="margin-top:11px"></div>
+
+  <p style="font-size:11.5px;color:var(--dim);margin:11px 0 0">
+  <b>Penting:</b> torsi tidak bisa diubah dari sini. Kalau uji ini
+  meleset bahkan pada kecepatan rendah, masalahnya bukan kecepatan
+  melainkan <b>arus TB6600</b>. Ubah DIP switch <b>SW1/SW2/SW3</b> ke
+  1.5 sampai 2.0 A, atau turunkan microstep dari 16 ke 8.
+  Lihat <code>docs/RISET-PRESISI-STEPPER.md</code>.</p>
+</div>
+
 <div class="card"><h2>Kendali Lid</h2>
   <div class="row"><span class="k">Buka / tutup lid</span>
     <span>
@@ -3088,11 +3393,56 @@ function load(){
     perbaruiKendali(s);
     perbaruiPresisi(s);
     perbaruiMotor(s);
+    perbaruiSweep(s);
 
     renderDiagnosa(diagnosa(s, jm, ja));
   }).catch(()=>{ $('logtxt').textContent = 'ROBOT TIDAK MERESPONS'; });
 }
 
+
+// ---------- HASIL UJI TORSI & KECEPATAN ----------
+//
+// Menampilkan ringkasan hasil sweep. Rincian per tahap ada di log,
+// jadi di sini hanya kesimpulannya supaya tidak ramai.
+function perbaruiSweep(s){
+  var el = document.getElementById('sweepHasil');
+  if (!el) return;
+
+  var n = s.sweepN || 0;
+  if (n === 0){ el.innerHTML = ''; return; }
+
+  var gagal = s.sweepGagal || 0;
+  var aman  = (typeof s.sweepAman === 'number') ? s.sweepAman / 10 : -1;
+
+  var warna, kunci, pesan;
+
+  if (aman <= 0 && gagal > 0){
+    warna = 'er';
+    kunci = 'MELESET DI SEMUA KECEPATAN';
+    pesan = 'Ini bukan masalah kecepatan. Periksa arus TB6600 (SW1-SW3, ' +
+            'butuh 1.5 sampai 2.0 A) dan coba turunkan microstep dari 16 ke 8.';
+  } else if (gagal === 0){
+    warna = 'ok';
+    kunci = 'SEMUA TAHAP TEPAT';
+    pesan = 'Motor kuat sampai tahap terakhir yang diuji. Kecepatan ' +
+            'tertinggi masih aman.';
+  } else {
+    warna = 'warn';
+    kunci = 'BATAS KETEMU';
+    pesan = 'Kecepatan aman tertinggi ' + aman + ' step/detik. ' +
+            'Pakai sekitar ' + Math.round(aman * 0.8) + ' step/detik ' +
+            'supaya ada cadangan tenaga.';
+  }
+
+  el.innerHTML =
+    '<div class="row"><span class="k">Tahap diuji</span><b>' + n + '</b></div>' +
+    '<div class="row"><span class="k">Tahap meleset</span><b class="' +
+      (gagal > 0 ? 'er' : 'ok') + '">' + gagal + '</b></div>' +
+    '<div class="row"><span class="k">Hasil</span><b class="' + warna +
+      '">' + kunci + '</b></div>' +
+    '<p style="font-size:11.5px;margin:9px 0 0" class="' + warna + '">' +
+      pesan + '</p>';
+}
 
 // ---------- MOTOR PENGGERAK ----------
 const MODE_NAMA = ['STOP', 'MAJU', 'MUNDUR', 'KIRI', 'KANAN'];
