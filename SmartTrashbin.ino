@@ -380,6 +380,42 @@ Stepper stLidRight = {
 };
 
 // ==================== MOTOR DC ====================
+//
+//  ------------------------------------------------------------
+//  KENAPA BELOK DULU TERASA SEPERTI SALAH SATU MOTOR TIDAK JALAN
+//  ------------------------------------------------------------
+//
+//  Versi lama memakai SATU nilai PWM untuk kedua roda, dan itulah
+//  sumber masalahnya. Ada dua sebab, dan keduanya nyata:
+//
+//  1. SETIAP MOTOR PUNYA TITIK MULAI BERBEDA.
+//     Motor DC tidak mulai berputar di PWM yang sama. Satu motor
+//     mungkin mulai bergerak di PWM 70, pasangannya baru di PWM 100.
+//     Akibatnya pada PWM rendah, satu roda sudah berputar sementara
+//     yang lain masih diam — persis gejala "ada motor yang seperti
+//     tidak jalan". Ini paling terasa saat berbelok, karena di situ
+//     kedua roda memang harus berlawanan arah dan torsi bebannya
+//     paling berat: seluruh berat robot diseret memutar, bukan
+//     didorong lurus.
+//
+//  2. BELOK ADALAH KONDISI PALING BERAT, TAPI MEMAKAI PWM YANG SAMA.
+//     Saat berbelok, robot harus mengalahkan gesekan roda terhadap
+//     lantai. Beban ini jauh lebih besar daripada saat maju. Kalau
+//     PWM-nya sama dengan PWM maju, motor yang titik mulainya lebih
+//     tinggi akan tertahan dan berhenti, sementara pasangannya jalan.
+//
+//  PERBAIKANNYA:
+//  - Tiap roda punya nilai PWM sendiri (pwmKiri / pwmKanan), sehingga
+//    ketidakseimbangan antar motor bisa dikompensasi.
+//  - Belok memakai PWM lebih tinggi daripada maju, karena bebannya
+//    memang lebih berat. Ini yang membuat putaran di tempat jadi
+//    lancar, bukan tersendat.
+//  - Nilai kompensasi bisa disetel dari HP lewat halaman /setting
+//    dan disimpan di flash.
+//
+//  Arah putar tiap roda ditentukan oleh motorBalikKiri /
+//  motorBalikKanan, jadi "putar di tempat" berlaku untuk roda mana
+//  pun, tidak peduli bagaimana kabelnya terpasang.
 
 void motorBegin() {
   pinMode(M_LEFT_D1,  OUTPUT);
@@ -418,16 +454,63 @@ void motorSideDrive(uint8_t pinPWM, uint8_t pinD1, uint8_t pinD2,
 //  yang berlawanan dengan tombolnya (tekan MAJU tapi robot mundur).
 //  Daripada membongkar kabel, arahnya dibalik di perangkat lunak.
 //
-//  Setel lewat halaman /debug (panel "Motor Penggerak"), atau lewat
-//  perintah Serial:
-//     RL1  -> balik arah motor KIRI
-//     RL0  -> kembalikan ke normal
-//     RR1 / RR0 -> sama untuk motor KANAN
+//  Setel lewat halaman /setting, atau lewat perintah Serial:
+//     YL1  -> balik arah motor KIRI
+//     YL0  -> kembalikan ke normal
+//     YR1 / YR0 -> sama untuk motor KANAN
 //
 //  Nilainya disimpan di memori flash, jadi tetap tersimpan setelah
 //  ESP32 dimatikan.
 bool motorBalikKiri  = false;
 bool motorBalikKanan = false;
+
+// ------------------------------------------------------------
+//  KOMPENSASI PWM PER RODA
+// ------------------------------------------------------------
+//  0 berarti tidak ada kompensasi, dan nilai di atas 0 berarti roda
+//  itu diberi PWM lebih tinggi daripada roda pasangannya.
+//
+//  Pakai ini kalau saat MAJU robot tidak lurus, atau saat berputar
+//  di tempat salah satu roda terlihat lebih lambat. Naikkan angka
+//  untuk roda yang lemah, bukan turunkan roda yang kuat, supaya
+//  tenaga robot tidak berkurang.
+int8_t pwmKompensasiKiri  = 0;
+int8_t pwmKompensasiKanan = 0;
+
+// Batas kompensasi, supaya salah setel tidak membuat roda diberi
+// PWM jauh di atas batas aman driver.
+const int8_t KOMPENSASI_MAKS = 60;
+
+// ------------------------------------------------------------
+//  TAMBAHAN PWM SAAT BERBELOK
+// ------------------------------------------------------------
+//  Berbelok menyeret roda ke samping, jadi bebannya lebih berat
+//  daripada maju. Tanpa tambahan ini, robot cenderung diam atau
+//  tersendat saat berputar di tempat.
+//
+//  Nilainya bisa diatur, dan disimpan di flash.
+uint8_t tambahanBelok = 45;
+
+// Batas atas, supaya driver dan motor tetap aman.
+const uint8_t TAMBAHAN_BELOK_MAKS = 90;
+
+// Hitung PWM akhir untuk satu roda, sudah termasuk kompensasi dan
+// tambahan belok. Hasilnya selalu dibatasi 0 sampai 255.
+uint8_t motorPwmUntuk(bool sisiKiri, bool sedangBelok) {
+  int nilai = (int)speedPWM;
+
+  nilai += sisiKiri ? (int)pwmKompensasiKiri
+                    : (int)pwmKompensasiKanan;
+
+  // Tambahan belok hanya diberikan kalau PWM dasarnya memang tidak nol.
+  // Kalau pengguna sengaja menyetel PWM 0, robot harus tetap diam.
+  if (sedangBelok && speedPWM > 0) nilai += (int)tambahanBelok;
+
+  if (nilai < 0)   nilai = 0;
+  if (nilai > 255) nilai = 255;
+
+  return (uint8_t)nilai;
+}
 
 void motorStop() {
   digitalWrite(M_LEFT_D1,  LOW);
@@ -439,23 +522,48 @@ void motorStop() {
 }
 
 void motorApply() {
+  // Belok dan mundur memang memutar roda ke arah yang berbeda dari
+  // roda pasangannya, jadi PWM-nya dihitung per roda.
+  const bool belok = (moveMode == MOVE_LEFT || moveMode == MOVE_RIGHT);
+
+  const uint8_t pL = motorPwmUntuk(true,  belok);
+  const uint8_t pR = motorPwmUntuk(false, belok);
+
   switch (moveMode) {
+    // --- MAJU: kedua roda berputar ke arah yang sama ---
     case MOVE_FWD:
-      motorSideDrive(M_LEFT_PWM,  M_LEFT_D1,  M_LEFT_D2,  !motorBalikKiri,  motorBalikKiri,  speedPWM);
-      motorSideDrive(M_RIGHT_PWM, M_RIGHT_D1, M_RIGHT_D2, !motorBalikKanan, motorBalikKanan, speedPWM);
+      motorSideDrive(M_LEFT_PWM,  M_LEFT_D1,  M_LEFT_D2,
+                     !motorBalikKiri,  motorBalikKiri,  pL);
+      motorSideDrive(M_RIGHT_PWM, M_RIGHT_D1, M_RIGHT_D2,
+                     !motorBalikKanan, motorBalikKanan, pR);
       break;
+
+    // --- MUNDUR: kebalikan dari maju ---
     case MOVE_BACK:
-      motorSideDrive(M_LEFT_PWM,  M_LEFT_D1,  M_LEFT_D2,  motorBalikKiri,  !motorBalikKiri,  speedPWM);
-      motorSideDrive(M_RIGHT_PWM, M_RIGHT_D1, M_RIGHT_D2, motorBalikKanan, !motorBalikKanan, speedPWM);
+      motorSideDrive(M_LEFT_PWM,  M_LEFT_D1,  M_LEFT_D2,
+                     motorBalikKiri,  !motorBalikKiri,  pL);
+      motorSideDrive(M_RIGHT_PWM, M_RIGHT_D1, M_RIGHT_D2,
+                     motorBalikKanan, !motorBalikKanan, pR);
       break;
+
+    // --- PUTAR DI TEMPAT KE KIRI ---
+    // Roda kiri mundur, roda kanan maju. Robot berputar pada porosnya.
     case MOVE_LEFT:
-      motorSideDrive(M_LEFT_PWM,  M_LEFT_D1,  M_LEFT_D2,  motorBalikKiri,  !motorBalikKiri,  speedPWM);
-      motorSideDrive(M_RIGHT_PWM, M_RIGHT_D1, M_RIGHT_D2, !motorBalikKanan, motorBalikKanan, speedPWM);
+      motorSideDrive(M_LEFT_PWM,  M_LEFT_D1,  M_LEFT_D2,
+                     motorBalikKiri,  !motorBalikKiri,  pL);
+      motorSideDrive(M_RIGHT_PWM, M_RIGHT_D1, M_RIGHT_D2,
+                     !motorBalikKanan, motorBalikKanan, pR);
       break;
+
+    // --- PUTAR DI TEMPAT KE KANAN ---
+    // Kebalikan dari putar kiri.
     case MOVE_RIGHT:
-      motorSideDrive(M_LEFT_PWM,  M_LEFT_D1,  M_LEFT_D2,  !motorBalikKiri,  motorBalikKiri,  speedPWM);
-      motorSideDrive(M_RIGHT_PWM, M_RIGHT_D1, M_RIGHT_D2, motorBalikKanan, !motorBalikKanan, speedPWM);
+      motorSideDrive(M_LEFT_PWM,  M_LEFT_D1,  M_LEFT_D2,
+                     !motorBalikKiri,  motorBalikKiri,  pL);
+      motorSideDrive(M_RIGHT_PWM, M_RIGHT_D1, M_RIGHT_D2,
+                     motorBalikKanan, !motorBalikKanan, pR);
       break;
+
     default:
       motorStop();
       break;
@@ -1514,12 +1622,34 @@ void pilihProfil(uint8_t p, bool simpan) {
   if (simpan) simpanProfil();
 }
 
-// Simpan pilihan profil ke flash.
+// Simpan setelan motor penggerak ke flash. Dipanggil setiap kali ada
+// yang diubah, supaya tidak hilang saat ESP32 dimatikan.
+void simpanMotor() {
+  Preferences p;
+  if (!p.begin("trashbin", false)) return;
+
+  p.putBool("balikKiri",  motorBalikKiri);
+  p.putBool("balikKanan", motorBalikKanan);
+  p.putChar("kompKiri",   pwmKompensasiKiri);
+  p.putChar("kompKanan",  pwmKompensasiKanan);
+  p.putUChar("tambahBelok", tambahanBelok);
+  p.putUChar("profil",    profilAktif);
+
+  p.end();
+}
+
+// Simpan hanya pilihan profil. Dipakai saat tombol kecepatan ditekan.
 void simpanProfil() {
   Preferences p;
   if (!p.begin("trashbin", false)) return;
   p.putUChar("profil", profilAktif);
   p.end();
+}
+
+// Nama lama untuk simpanMotor(), dipertahankan supaya bagian kode
+// yang lama tidak perlu diubah semuanya.
+void simpanArahMotor() {
+  simpanMotor();
 }
 
 // Muat pilihan profil dari flash saat robot menyala.
@@ -1558,10 +1688,21 @@ void muatSudutGlobal() {
 
   float v = p.getFloat("lidAngle", LID_ANGLE_DEF);
 
-  // Sekalian muat setelan pembalik arah motor, karena keduanya
+  // Sekalian muat setelan motor penggerak, karena keduanya
   // disimpan di tempat yang sama.
   motorBalikKiri  = p.getBool("balikKiri",  false);
   motorBalikKanan = p.getBool("balikKanan", false);
+
+  pwmKompensasiKiri  = p.getChar("kompKiri",  (int8_t)0);
+  pwmKompensasiKanan = p.getChar("kompKanan", (int8_t)0);
+  tambahanBelok      = p.getUChar("tambahBelok", (uint8_t)45);
+
+  // Jaga-jaga kalau nilai di flash rusak atau di luar batas.
+  if (pwmKompensasiKiri  < -KOMPENSASI_MAKS) pwmKompensasiKiri  = -KOMPENSASI_MAKS;
+  if (pwmKompensasiKiri  >  KOMPENSASI_MAKS) pwmKompensasiKiri  =  KOMPENSASI_MAKS;
+  if (pwmKompensasiKanan < -KOMPENSASI_MAKS) pwmKompensasiKanan = -KOMPENSASI_MAKS;
+  if (pwmKompensasiKanan >  KOMPENSASI_MAKS) pwmKompensasiKanan =  KOMPENSASI_MAKS;
+  if (tambahanBelok > TAMBAHAN_BELOK_MAKS)   tambahanBelok      = TAMBAHAN_BELOK_MAKS;
 
   p.end();
 
@@ -1569,19 +1710,12 @@ void muatSudutGlobal() {
   lidAngleGlobal = v;
 
   addLogf("[SUDUT] Sudut global dimuat dari memori = %.1f derajat", lidAngleGlobal);
-  addLogf("[MOTOR] Pembalik arah: KIRI=%s KANAN=%s",
+  addLogf("[MOTOR] Arah: KIRI=%s KANAN=%s",
           motorBalikKiri  ? "DIBALIK" : "normal",
           motorBalikKanan ? "DIBALIK" : "normal");
-}
-
-// Simpan setelan pembalik arah motor. Dipanggil setiap kali diubah
-// supaya tidak hilang saat ESP32 dimatikan.
-void simpanArahMotor() {
-  Preferences p;
-  if (!p.begin("trashbin", false)) return;
-  p.putBool("balikKiri",  motorBalikKiri);
-  p.putBool("balikKanan", motorBalikKanan);
-  p.end();
+  addLogf("[MOTOR] Kompensasi: KIRI=%+d KANAN=%+d, tambahan belok=+%d",
+          (int)pwmKompensasiKiri, (int)pwmKompensasiKanan,
+          (int)tambahanBelok);
 }
 
 // ==================== LOGIKA PERINTAH (dipakai WiFi & BLE) ====================
@@ -1795,6 +1929,62 @@ void executeCommand(char cmd, const String &arg) {
       break;
     }
 
+    // ============================================================
+    //  'Z' = KOMPENSASI RODA DAN TAMBAHAN TENAGA SAAT BELOK
+    // ============================================================
+    //  Dipakai kalau saat maju robot tidak lurus, atau saat berputar
+    //  di tempat salah satu roda terlihat lebih lambat.
+    //
+    //    ZL<n>  -> kompensasi roda KIRI,  -60 sampai +60
+    //    ZR<n>  -> kompensasi roda KANAN, -60 sampai +60
+    //    ZB<n>  -> tambahan PWM saat belok, 0 sampai 90
+    //
+    //  Contoh: ZL15 berarti roda kiri diberi PWM 15 lebih tinggi
+    //  daripada nilai dasar. Naikkan angka untuk roda yang lemah,
+    //  jangan turunkan roda yang kuat.
+    //
+    //  Semua nilai disimpan di flash.
+    case 'Z': {
+      String a = arg;
+      a.toUpperCase();
+
+      if (a.length() < 2) {
+        addLog("[MOTOR] Format: ZL<n>, ZR<n>, atau ZB<n>");
+        break;
+      }
+
+      char apa = a.charAt(0);
+      int  v   = a.substring(1).toInt();
+
+      if (apa == 'L' || apa == 'R') {
+        if (v < -KOMPENSASI_MAKS) v = -KOMPENSASI_MAKS;
+        if (v >  KOMPENSASI_MAKS) v =  KOMPENSASI_MAKS;
+
+        if (apa == 'L') pwmKompensasiKiri  = (int8_t)v;
+        else            pwmKompensasiKanan = (int8_t)v;
+
+        simpanMotor();
+        addLogf("[MOTOR] Kompensasi roda %s = %+d",
+                (apa == 'L' ? "KIRI" : "KANAN"), v);
+
+      } else if (apa == 'B') {
+        if (v < 0) v = 0;
+        if (v > TAMBAHAN_BELOK_MAKS) v = TAMBAHAN_BELOK_MAKS;
+
+        tambahanBelok = (uint8_t)v;
+        simpanMotor();
+        addLogf("[MOTOR] Tambahan PWM saat belok = +%d", v);
+
+      } else {
+        addLog("[MOTOR] Format: ZL<n>, ZR<n>, atau ZB<n>");
+        break;
+      }
+
+      // Terapkan segera supaya perubahan bisa langsung dirasakan.
+      if (moveMode != MOVE_STOP) motorApply();
+      break;
+    }
+
     // 'X' = saklar uji untuk mencari penyebab perioda pulsa panjang.
     //   XB1 -> matikan BLE (uji: apakah BLE/flash yang menahan pulsa)
     //   XB0 -> hidupkan BLE
@@ -1988,17 +2178,33 @@ void handleCmd() {
 }
 
 void handleStatus() {
-  char buf[220];
+  char buf[300];
   snprintf(buf, sizeof(buf),
            "{\"ll\":%.1f,\"lr\":%.1f,\"lopen\":%.1f,\"bl\":%d,"
-           "\"move\":\"%s\",\"mv\":%d,\"sp\":%d}",
+           "\"move\":\"%s\",\"mv\":%d,\"sp\":%d,"
+           "\"profil\":%d,\"pwm\":%d,"
+           "\"belok\":%d,\"kompKiri\":%d,\"kompKanan\":%d,"
+           "\"balikL\":%d,\"balikR\":%d,\"holdMode\":%d,"
+           "\"lidAngle\":%.1f,"
+           "\"pwmKiri\":%d,\"pwmKanan\":%d}",
            stLidLeft.currentStep  / STEPS_PER_DEG,
            stLidRight.currentStep / STEPS_PER_DEG,
            lidAngleGlobal,
            stepperBusy() ? 1 : 0,
            (moveMode == MOVE_STOP) ? "stop" : "run",
            (int)moveMode,
-           (int)speedPWM);
+           (int)stepSpeedActive,
+           (int)profilAktif,
+           (int)speedPWM,
+           (int)tambahanBelok,
+           (int)pwmKompensasiKiri,
+           (int)pwmKompensasiKanan,
+           motorBalikKiri  ? 1 : 0,
+           motorBalikKanan ? 1 : 0,
+           holdMode ? 1 : 0,
+           lidAngleGlobal,
+           (int)motorPwmUntuk(true,  false),
+           (int)motorPwmUntuk(false, false));
   server.send(200, "application/json", buf);
 }
 
@@ -2082,6 +2288,11 @@ void handleDebugJson() {
       "\"sp\":%d,"
       "\"moveMode\":%d,"
       "\"pwm\":%d,"
+      "\"pwmKiri\":%d,"
+      "\"pwmKanan\":%d,"
+      "\"belok\":%d,"
+      "\"kompKiri\":%d,"
+      "\"kompKanan\":%d,"
       "\"timeoutS\":%lu,"
       "\"stepsPerDeg\":%.4f"
     "}",
@@ -2142,6 +2353,11 @@ void handleDebugJson() {
     (int)stepSpeedActive,
     (int)moveMode,
     (int)speedPWM,
+    (int)motorPwmUntuk(true,  false),
+    (int)motorPwmUntuk(false, false),
+    (int)tambahanBelok,
+    (int)pwmKompensasiKiri,
+    (int)pwmKompensasiKanan,
     CMD_TIMEOUT_MS / 1000,
     STEPS_PER_DEG);
 
@@ -3182,6 +3398,84 @@ border:1px solid var(--bd)}
   untuk memastikan arahnya sudah benar.</p>
 </div>
 
+<!-- ============ BELOK ============ -->
+<div class="card">
+  <h2>Belok di Tempat</h2>
+  <p class="ket">Kalau saat berbelok ada roda yang seperti tidak jalan,
+  naikkan <b>tenaga belok</b>. Berbelok menyeret roda ke samping,
+  jadi bebannya lebih berat daripada maju.</p>
+
+  <div class="row">
+    <span class="label">Tenaga tambahan saat belok
+      <span class="hint" id="hintBelok">-</span></span>
+    <span class="nilai" id="valBelok">-</span>
+  </div>
+  <input type="range" id="belok" min="0" max="90" value="45">
+  <div class="pil" style="margin-top:9px">
+    <button onclick="setBelok(0)">0</button>
+    <button onclick="setBelok(30)">30</button>
+    <button onclick="setBelok(45)">45</button>
+    <button onclick="setBelok(70)">70</button>
+    <button onclick="setBelok(90)">90</button>
+  </div>
+
+  <div class="row" style="margin-top:13px">
+    <span class="label">Uji putar<span class="hint">Tekan dan tahan</span></span>
+    <span>
+      <button id="bputarL" onmousedown="putar('L')" onmouseup="stopRoda()"
+        ontouchstart="putar('L')" ontouchend="stopRoda()">&#9664; KIRI</button>
+      <button id="bputarR" onmousedown="putar('R')" onmouseup="stopRoda()"
+        ontouchstart="putar('R')" ontouchend="stopRoda()">KANAN &#9654;</button>
+    </span>
+  </div>
+</div>
+
+<!-- ============ KESEIMBANGAN RODA ============ -->
+<div class="card">
+  <h2>Keseimbangan Roda</h2>
+  <p class="ket">Pakai kalau saat maju robot tidak lurus. Naikkan angka
+  untuk roda yang <b>lemah</b>, jangan turunkan roda yang kuat, supaya
+  tenaga robot tidak berkurang.</p>
+
+  <div class="row">
+    <span class="label">Kompensasi roda kiri
+      <span class="hint" id="hintKL">-</span></span>
+    <span class="nilai" id="valKL">-</span>
+  </div>
+  <input type="range" id="kl" min="-60" max="60" value="0">
+  <div class="pil" style="margin-top:7px">
+    <button onclick="setKomp('L',-20)">-20</button>
+    <button onclick="setKomp('L',-10)">-10</button>
+    <button onclick="setKomp('L',0)">0</button>
+    <button onclick="setKomp('L',10)">+10</button>
+    <button onclick="setKomp('L',20)">+20</button>
+  </div>
+
+  <div class="row" style="margin-top:13px">
+    <span class="label">Kompensasi roda kanan
+      <span class="hint" id="hintKR">-</span></span>
+    <span class="nilai" id="valKR">-</span>
+  </div>
+  <input type="range" id="kr" min="-60" max="60" value="0">
+  <div class="pil" style="margin-top:7px">
+    <button onclick="setKomp('R',-20)">-20</button>
+    <button onclick="setKomp('R',-10)">-10</button>
+    <button onclick="setKomp('R',0)">0</button>
+    <button onclick="setKomp('R',10)">+10</button>
+    <button onclick="setKomp('R',20)">+20</button>
+  </div>
+
+  <div class="pil" style="margin-top:13px">
+    <button onclick="c('F')" style="flex:1">Uji MAJU</button>
+    <button onclick="stopRoda()" style="flex:1">STOP</button>
+  </div>
+
+  <div class="row" style="margin-top:11px">
+    <span class="label">PWM akhir tiap roda</span>
+    <span class="nilai" id="valAkhir">-</span>
+  </div>
+</div>
+
 <!-- ============ MODE TAHAN ============ -->
 <div class="card">
   <h2>Mode Tahan Tutup</h2>
@@ -3311,6 +3605,65 @@ var KET = [
 var TUTUP_MS = [ 'sekitar 2.3 detik', 'sekitar 1.1 detik', 'sekitar 0.9 detik' ];
 var RODA_KET = [ 'pelan', 'sedang', 'kencang' ];
 
+/* ---------- BELOK DI TEMPAT ---------- */
+
+var putarTimer = null;
+
+/* Selama tombol putar ditahan, kirim ulang perintahnya supaya roda
+   tidak berhenti sendiri gara-gara pengaman waktu di firmware. */
+function putar(arah){
+  c(arah);
+  if (putarTimer) clearInterval(putarTimer);
+  putarTimer = setInterval(function(){ c(arah); }, 1500);
+}
+
+function stopRoda(){
+  if (putarTimer) { clearInterval(putarTimer); putarTimer = null; }
+  c('P');
+}
+
+function setBelok(v){
+  c('ZB' + v);
+  pesan('Tenaga belok: +' + v, 'ok');
+}
+
+/* ---------- KESEIMBANGAN RODA ---------- */
+
+function setKomp(sisi, v){
+  c('Z' + sisi + v);
+  pesan('Kompensasi ' + (sisi === 'L' ? 'kiri' : 'kanan') +
+        ': ' + (v > 0 ? '+' : '') + v, 'ok');
+}
+
+var sliderBelok = $('belok');
+var sliderKL = $('kl');
+var sliderKR = $('kr');
+
+/* Saat slider digeser, tampilkan angkanya saja. Perintah baru
+   dikirim ketika jari diangkat, supaya tidak membanjiri robot
+   dengan puluhan perintah. */
+sliderBelok.addEventListener('input',
+  function(){ $('valBelok').textContent = '+' + sliderBelok.value; });
+sliderBelok.addEventListener('change',
+  function(){ setBelok(sliderBelok.value); });
+
+sliderKL.addEventListener('input',
+  function(){ $('valKL').textContent = tanda(sliderKL.value); });
+sliderKL.addEventListener('change',
+  function(){ setKomp('L', sliderKL.value); });
+
+sliderKR.addEventListener('input',
+  function(){ $('valKR').textContent = tanda(sliderKR.value); });
+sliderKR.addEventListener('change',
+  function(){ setKomp('R', sliderKR.value); });
+
+function tanda(v){
+  v = parseInt(v, 10);
+  return (v > 0 ? '+' : '') + v;
+}
+
+/* ---------- KUMPULKAN STATUS ---------- */
+
 function muat(){
   fetch('/status', {cache:'no-store'})
     .then(function(r){ return r.json(); })
@@ -3343,6 +3696,35 @@ function muat(){
 
       $('bh1').className = s.holdMode ? 'pilih' : '';
       $('bh0').className = s.holdMode ? '' : 'pilih';
+
+      /* Setelan roda: baca dari robot, jangan disimpan di halaman.
+         Supaya kalau dibuka dari HP lain tampilannya tetap benar. */
+      if (typeof s.belok === 'number'){
+        sliderBelok.value = s.belok;
+        $('valBelok').textContent = '+' + s.belok;
+        $('hintBelok').textContent = s.belok < 20
+          ? 'masih rendah, roda bisa tersendat saat berbelok'
+          : (s.belok > 70 ? 'tinggi, hati-hati arus driver'
+                          : 'nilai yang wajar');
+      }
+
+      if (typeof s.kompKiri === 'number'){
+        sliderKL.value = s.kompKiri;
+        $('valKL').textContent = tanda(s.kompKiri);
+        $('hintKL').textContent = s.kompKiri === 0
+          ? 'tidak ada kompensasi' : 'roda kiri diberi PWM lebih tinggi';
+      }
+
+      if (typeof s.kompKanan === 'number'){
+        sliderKR.value = s.kompKanan;
+        $('valKR').textContent = tanda(s.kompKanan);
+        $('hintKR').textContent = s.kompKanan === 0
+          ? 'tidak ada kompensasi' : 'roda kanan diberi PWM lebih tinggi';
+      }
+
+      if (typeof s.pwmKiri === 'number'){
+        $('valAkhir').textContent = s.pwmKiri + ' / ' + s.pwmKanan;
+      }
 
       if (document.activeElement !== slider){
         slider.value = s.pwm || 0;
