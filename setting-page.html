@@ -44,7 +44,7 @@ border:1px solid var(--bd)}
 </style></head><body>
 
 <h1>Setelan</h1>
-<div class="sub">Atur robot tanpa harus menggerakkannya</div>
+<div class="sub">Atur robot tanpa menggerakkannya</div>
 
 <div class="tab">
   <a href="/">Kontrol</a>
@@ -74,8 +74,7 @@ border:1px solid var(--bd)}
 <!-- ============ KECEPATAN TUTUP (STEPPER) ============ -->
 <div class="card">
   <h2>Kecepatan Tutup</h2>
-  <p class="ket">Terpisah dari kecepatan roda. Mengubah roda tidak
-  mengubah setelan ini.</p>
+  <p class="ket">Kecepatan tutup saat membuka dan menutup.</p>
 
   <div class="row">
     <span class="label">Kecepatan sekarang</span>
@@ -98,13 +97,8 @@ border:1px solid var(--bd)}
     <button onclick="setSps(1200)">1200</button>
   </div>
 
-  <p class="ket" style="margin:11px 0 0">
-    Pada microstep 1/8, 450 step per detik berarti tutup bergerak
-    sekitar 100 derajat per detik (1 derajat = 4,444 langkah).
-    Turunkan kalau tutup kehilangan langkah atau terdengar
-    terputus-putus. Nilai ini disimpan dan tetap berlaku setelah
-    robot dimatikan.
-  </p>
+  <p class="ket">Pada microstep 1/8, 450 step per detik = tutup bergerak
+  sekitar 100 derajat per detik.</p>
 </div>
 
 <div class="card">
@@ -136,8 +130,7 @@ border:1px solid var(--bd)}
 <!-- ============ ARAH MOTOR ============ -->
 <div class="card">
   <h2>Arah Motor Roda</h2>
-  <p class="ket">Kalau robot bergerak terbalik dari tombolnya, balik
-  arah di sini. Tidak perlu membongkar kabel.</p>
+  <p class="ket">Robot bergerak terbalik dari tombolnya? Balik arahnya di sini.</p>
 
   <div class="row">
     <span class="label">Motor kiri</span>
@@ -158,16 +151,13 @@ border:1px solid var(--bd)}
     <button onclick="c('F')" style="flex:1">Uji MAJU</button>
     <button onclick="c('P')" style="flex:1">STOP</button>
   </div>
-  <p class="ket" style="margin:9px 0 0">Tekan Uji MAJU sebentar saja
-  untuk memastikan arahnya sudah benar.</p>
+  <p class="ket" style="margin:9px 0 0">Tekan Uji MAJU sebentar saja.</p>
 </div>
 
 <!-- ============ BELOK ============ -->
 <div class="card">
   <h2>Belok di Tempat</h2>
-  <p class="ket">Kalau saat berbelok ada roda yang seperti tidak jalan,
-  naikkan <b>tenaga belok</b>. Berbelok menyeret roda ke samping,
-  jadi bebannya lebih berat daripada maju.</p>
+  <p class="ket">Naikkan kalau ada roda yang seperti tidak jalan saat berbelok.</p>
 
   <div class="row">
     <span class="label">Tenaga tambahan saat belok
@@ -197,9 +187,7 @@ border:1px solid var(--bd)}
 <!-- ============ KESEIMBANGAN RODA ============ -->
 <div class="card">
   <h2>Keseimbangan Roda</h2>
-  <p class="ket">Pakai kalau saat maju robot tidak lurus. Naikkan angka
-  untuk roda yang <b>lemah</b>, jangan turunkan roda yang kuat, supaya
-  tenaga robot tidak berkurang.</p>
+  <p class="ket">Robot tidak lurus saat maju? Naikkan angka roda yang lemah.</p>
 
   <div class="row">
     <span class="label">Kompensasi roda kiri
@@ -243,9 +231,8 @@ border:1px solid var(--bd)}
 <!-- ============ MODE TAHAN ============ -->
 <div class="card">
   <h2>Mode Tahan Tutup</h2>
-  <p class="ket">Saat aktif, motor tutup terus diberi arus sehingga
-  tutup tidak turun sendiri karena beratnya. Motor akan terasa hangat,
-  dan baterai lebih cepat habis.</p>
+  <p class="ket">Motor tutup terus diberi arus supaya tutup tidak turun
+  sendiri. Motor jadi hangat dan baterai lebih cepat habis.</p>
 
   <div class="row">
     <span class="label">Tahan tutup</span>
@@ -262,8 +249,7 @@ border:1px solid var(--bd)}
   <div class="row"><span class="label">Kecepatan roda langsung</span>
     <span class="nilai"><span id="valPwm">-</span></span></div>
   <input type="range" id="pwm" min="0" max="255" value="165">
-  <p class="ket" style="margin:8px 0 0">Geser untuk mengubah kecepatan
-  roda saja, tanpa mengubah kecepatan tutup.</p>
+  <p class="ket" style="margin:8px 0 0">Mengubah kecepatan roda saja.</p>
 
   <div class="row" style="margin-top:12px">
     <span class="label">Nolkan posisi tutup</span>

@@ -204,8 +204,8 @@ In order:
 
 Five causes, in the order they usually bite:
 1. **Signal wiring.** See §3. Fix this first.
-2. **Too fast.** Lower the speed with `K300` or `K600` from `/debug`. If it is smooth
-   at `K600` but shudders at `K1600`, the limit is torque, not signal.
+2. **Too fast.** Lower the speed with `K200` or `K450` from `/debug`. If it is smooth
+   at `K450` but shudders at `K1200`, the limit is torque, not signal.
 3. **Current.** A NEMA 17 wants 1.5–2.0 A.
 4. **Microstep.** If it is not 1/8 here, every angle in the firmware is wrong.
 5. **Coil order.** Wrong pairing still moves the motor, but badly.
@@ -349,8 +349,9 @@ Reading `/debug`: jitter under 50 µs is smooth, 50–200 µs is slightly rough,
 200 µs is visibly snatchy. The automatic diagnosis panel interprets the numbers for
 you.
 
-The speed buttons (`K600`…`K2000`) reset to the default on reboot; they are not
-saved.
+The speed buttons (`K200`…`K1200`) reset to the default on reboot; they are not
+saved. The `/debug` page shows the same reading thresholds next to each panel, so
+you can judge the numbers without coming back here.
 
 ---
 

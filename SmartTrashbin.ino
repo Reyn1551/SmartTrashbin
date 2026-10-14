@@ -139,7 +139,7 @@ void addLogf(const char* fmt, ...) {
 // of holding torque, so doubling step torque matters.
 // RULE: on any DIP microstep change update these constants AND DIP_TERAKHIR,
 // then re-upload - else lid angles go silently wrong.
-// Source: Faulhaber App Note 015, docs/MENGATUR-TORSI-STEPPER.md
+// Source: Faulhaber App Note 015; see HARDWARE.md section 5.
 const float STEPS_PER_REV = 1600.0;
 const float STEPS_PER_DEG = STEPS_PER_REV / 360.0;   // 4.4444
 
@@ -219,8 +219,8 @@ uint8_t profilAktif = PROFIL_MEDIUM;
 // move (400 steps) takes ~0.9 s.
 // WHY NOT 600: 600 was the value at microstep 1/16. At 1/8 pulses per degree
 // HALVE, so 600 moves the lid TWICE as fast - the easiest way to lose steps on a
-// heavy iris lid. 450 matches the tested MEDIUM number at 1/8 in
-// docs/MENGATUR-TORSI-STEPPER.md.
+// heavy iris lid. 450 matches the tested MEDIUM number at 1/8 (HARDWARE.md
+// section 8).
 #define STEP_DEFAULT_SPS   450.0f
 
 // Active stepper speed. Set by the K command, saved to flash across power off.
