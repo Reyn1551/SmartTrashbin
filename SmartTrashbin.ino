@@ -1,41 +1,16 @@
 /*
- * ============================================================
- *  SMART TRASHBIN — ESP32 WIFI AP + BLE
- *  Motor DC (roda) + 2x Stepper TB6600 (lid)
- * ============================================================
- *
- *  DUA JALUR KONTROL (bersamaan, pilih salah satu di HP):
- *
- *  1. WIFI ACCESS POINT  <- cara utama, paling mudah
- *     - ESP32 memancarkan hotspot:  SmartTrashbin
- *     - Password:                   12345678
- *     - Buka browser ke:            http://192.168.4.1
- *     - UI sudah tertanam di firmware, tidak perlu file apa pun
- *
- *  2. BLUETOOTH LE       <- cadangan, kalau WiFi bermasalah
- *     - Nama device:  SmartTrashbin
- *     - Pakai controller-ble.html + server lokal di laptop
- *
- *  ------------------------------------------------------------
- *  HARDWARE (verified):
- *    Board : ESP32 DevKit V4 32D (ESP32-D0WD-V3 rev 3.1)
- *    Port  : COM6 via CP2102
- *
- *  MOTOR DC — driver BTN7970
- *    Roda KIRI  : PWM=25  D1=27  D2=26
- *    Roda KANAN : PWM=14  D1=13  D2=12
- *
- *  STEPPER LID — driver TB6600 (microstep 16 -> 3200 pulse/rev)
- *    Lid KIRI  : PUL=18  DIR=19  ENA=23
- *    Lid KANAN : PUL=15  DIR=4   ENA=5
- *
- *  ------------------------------------------------------------
- *  CATATAN GPIO15
- *  GPIO15 adalah strapping pin ESP32. Kalau TB6600 menariknya HIGH
- *  saat boot, ESP32 bisa gagal start. Kode ini tidak menyentuhnya
- *  sampai setup() selesai. Kalau board gagal boot: lepas kabel PUL
- *  lid kanan, boot, sambungkan kembali.
- * ============================================================
+ * SMART TRASHBIN — ESP32 WiFi AP + BLE. DC motor (wheels) + 2x TB6600 stepper (lid).
+ * Control paths (either from phone):
+ *  1. WiFi AP (primary): SSID SmartTrashbin / pass 12345678 / http://192.168.4.1
+ *     UI embedded in firmware, no files needed.
+ *  2. BLE (backup): device SmartTrashbin + controller-ble.html on a laptop.
+ * HARDWARE (verified): ESP32 DevKit V4 32D (D0WD-V3 rev 3.1), COM6 via CP2102
+ *   DC motor BTN7970: L PWM=25 D1=27 D2=26 | R PWM=14 D1=13 D2=12
+ *   Stepper lid TB6600 (microstep 8 = 1600 pulse/rev, 2.0 A):
+ *     L PUL=18 DIR=19 ENA=23 | R PUL=15 DIR=4 ENA=5
+ * GPIO15 is a strapping pin: if TB6600 holds it HIGH at boot the board can fail
+ * to start, so this code leaves it alone until setup() ends. Board will not
+ * boot -> unplug right lid PUL, boot, reconnect.
  */
 
 #include <WiFi.h>
@@ -44,44 +19,42 @@
 #include <BLEUtils.h>
 #include <BLEServer.h>
 #include <BLE2902.h>
-#include <esp_timer.h>     // hardware timer untuk pulsa stepper (anti-jitter)
-#include <esp_system.h>    // esp_reset_reason() - pelacak reset/brownout
-#include <Preferences.h>   // simpan sudut lid global ke flash (NVS)
-#include <stdarg.h>        // va_list untuk addLogf()
+#include <esp_timer.h>     // HW timer for stepper pulses (anti-jitter)
+#include <esp_system.h>    // esp_reset_reason() - reset/brownout tracking
+#include <Preferences.h>   // persist global lid angle to flash (NVS)
+#include <stdarg.h>        // va_list for addLogf()
 
-#include "web_ui.h"      // dibuat oleh konversi-html.py
+// Generated pages, all produced by konversi-html.py. Edit the matching .html
+// source, never these headers.
+#include "web_ui.h"       // INDEX_HTML,   control panel at /
+#include "setting_ui.h"   // SETTING_HTML, settings page at /setting
+#include "debug_ui.h"     // DEBUG_HTML,   diagnostics page at /debug
 
-// ==================== KONFIGURASI WIFI ====================
+// ==================== WIFI CONFIG ====================
 
 const char* AP_SSID = "SmartTrashbin";
-const char* AP_PASS = "12345678";        // minimal 8 karakter
+const char* AP_PASS = "12345678";        // min 8 chars
 const byte  AP_CHANNEL = 6;
 const byte  AP_MAX_CONN = 4;
 
 WebServer server(80);
 
-// ==================== STATE (didefinisikan paling awal) ====================
-//
-//  Struct Stepper HARUS ada di sini — sebelum semua fungsi.
-//  Arduino IDE menyisipkan prototipe fungsi otomatis di dekat atas file;
-//  kalau struct ini diletakkan setelah fungsi stepper, prototipe
-//  `void stepperBegin(Stepper&)` akan muncul sebelum struct dikenali dan
-//  menyebabkan error "'Stepper' was not declared in this scope".
+// ==================== STATE (defined first) ====================
+// Stepper must precede all functions: Arduino IDE auto-inserts prototypes near
+// the top, so a struct declared after the stepper functions makes
+// `void stepperBegin(Stepper&)` land before Stepper is known ->
+// "'Stepper' was not declared in this scope".
 
 enum MoveMode { MOVE_STOP, MOVE_FWD, MOVE_BACK, MOVE_LEFT, MOVE_RIGHT };
 volatile MoveMode moveMode = MOVE_STOP;
 
-unsigned long lastCmdMillis = 0;              // watchdog: kapan perintah terakhir
+unsigned long lastCmdMillis = 0;              // watchdog: time of last command
 
-// Batas waktu tanpa perintah sebelum roda distop otomatis. Ini pengaman
-// supaya robot tidak terus jalan kalau HP mati atau WiFi terputus.
-//
-// Nilainya sengaja longgar, bukan ketat. Sebelumnya 2500 ms dan terasa
-// seperti "robot berhenti sendiri padahal tombol masih ditahan", karena
-// satu saja heartbeat yang telat sudah cukup untuk memicu stop. Dengan
-// 8000 ms, heartbeat yang sesekali telat tidak lagi memutus gerakan,
-// tapi robot tetap berhenti dalam hitungan detik kalau HP benar-benar
-// hilang.
+// Wheel stop timeout with no command: safety so the robot does not keep
+// driving if the phone dies or WiFi drops. Deliberately loose: at 2500 ms it
+// felt like "robot stops by itself while the button is held" (one late
+// heartbeat triggered a stop). 8000 ms tolerates late heartbeats yet still
+// stops within seconds if the phone is really gone.
 const unsigned long CMD_TIMEOUT_MS = 8000;
 
 struct Stepper {
@@ -93,16 +66,16 @@ struct Stepper {
   unsigned long lastPulseUs;
   unsigned long halfPeriodUs;
   unsigned long pulseWidthUs;
-  int     warmUp;            // pulsa awal yang dilewati saat ukur jitter
-  float   speedCurrent;      // kecepatan sekarang (step/detik) - untuk ramp
-  float   speedTarget;       // kecepatan tujuan (step/detik)
+  int     warmUp;            // leading pulses skipped when measuring jitter
+  float   speedCurrent;      // current speed (steps/s), for ramp
+  float   speedTarget;       // target speed (steps/s)
   bool    pulseHigh;
   bool    enabled;
 };
 
 // ==================== WIRING ====================
 
-// --- Motor DC (BTN7970) ---
+// --- DC motor (BTN7970) ---
 const uint8_t M_LEFT_PWM  = 25;
 const uint8_t M_LEFT_D1   = 27;
 const uint8_t M_LEFT_D2   = 26;
@@ -110,7 +83,7 @@ const uint8_t M_RIGHT_PWM = 14;
 const uint8_t M_RIGHT_D1  = 13;
 const uint8_t M_RIGHT_D2  = 12;
 
-// --- Stepper Lid (TB6600) ---
+// --- Stepper lid (TB6600) ---
 const uint8_t LID_L_PUL = 18;
 const uint8_t LID_L_DIR = 19;
 const uint8_t LID_L_ENA = 23;
@@ -118,23 +91,20 @@ const uint8_t LID_R_PUL = 15;
 const uint8_t LID_R_DIR = 4;
 const uint8_t LID_R_ENA = 5;
 
-// ==================== LOG RING (untuk /debug tanpa laptop) ====================
-//
-//  Menyimpan 40 pesan terakhir di RAM. Bisa dibaca dari HP lewat
-//  http://192.168.4.1/debug  — jadi tidak perlu kabel/laptop.
-//
-//  Semua Serial.println penting juga masuk ke sini lewat addLog().
+// ==================== LOG RING (for /debug without a laptop) ====================
+// Last 40 messages in RAM, readable from the phone at http://192.168.4.1/debug.
+// Important Serial.println output also feeds it via addLog().
 
-#define LOG_LINES   60          // 40 terlalu sedikit, 120 memakan RAM
+#define LOG_LINES   60          // 40 too few, 120 eats RAM
 #define LOG_LEN     100
 
 char     logRing[LOG_LINES][LOG_LEN];
 uint8_t  logHead  = 0;
 uint16_t logTotal = 0;
-uint32_t logDrop  = 0;      // pesan yang hilang karena ring penuh
+uint32_t logDrop  = 0;      // messages lost because the ring was full
 
 void addLog(const char* msg) {
-  // Tulis ke Serial (kalau kabel tersambung) DAN ke ring buffer.
+  // Also to Serial (if connected) and into the ring buffer.
   Serial.println(msg);
 
   snprintf(logRing[logHead], LOG_LEN, "[%8lu] %s",
@@ -152,237 +122,162 @@ void addLogf(const char* fmt, ...) {
   addLog(buf);
 }
 
-// ==================== KONSTANTA STEPPER ====================
-//
-//  !!! JANGAN UBAH ANGKA DI BAWAH TANPA MENYAMAKAN DIP SWITCH !!!
-//
-//  Nilai ini HARUS cocok dengan setelan microstep di modul TB6600.
-//  Kalau tidak cocok, semua sudut jadi salah tanpa peringatan apa pun:
-//  firmware tetap melaporkan "90 derajat" padahal lid bergerak 45 atau
-//  180 derajat.
-//
-//  Cara menghitung:
-//      pulsa per putaran = 200 x pembagi microstep
-//      STEPS_PER_REV     = pulsa per putaran
-//      STEPS_PER_DEG     = STEPS_PER_REV / 360
-//
-//  Tabel lengkap, pakai yang sesuai DIP switch SW1/SW2/SW3:
-//
-//   setelan    mikro   pulsa/putaran   STEPS_PER_REV   STEPS_PER_DEG
-//   ON  ON  OFF  1/1        200            200.0           0.5556
-//   ON  OFF ON   1/2        400            400.0           1.1111
-//   ON  OFF OFF  1/4        800            800.0           2.2222
-//   OFF ON  OFF  1/8       1600           1600.0           4.4444  <-- SEKARANG
-//   OFF OFF ON   1/16      3200           3200.0           8.8889
-//   OFF OFF OFF  1/32      6400           6400.0          17.7778
-//
-//  Microstep sekarang 1/8, bukan 1/16. Alasannya torsi: pada microstep
-//  1/16 torsi per langkah hanya 9,80 persen torsi holding, sementara
-//  detent torque motor sendiri 5 sampai 20 persen. Jadi sebagian
-//  perintah langkah tidak menghasilkan gerakan sama sekali. Pada
-//  microstep 1/8 torsi per langkah naik ke 19,51 persen, dua kali
-//  lipat. Ini penting karena lid ini menggerakkan sekitar 20 gear
-//  sekaligus, jadi bebannya berat.
-//
-//  Sumber angka torsi: Faulhaber Application Note 015, lihat
-//  docs/MENGATUR-TORSI-STEPPER.md
+// ==================== STEPPER CONSTANTS ====================
+// !!! NEVER CHANGE THESE WITHOUT MATCHING THE DIP SWITCHES !!!
+// Must match the TB6600 microstep setting, else angles are silently wrong:
+// firmware reports "90 deg" while the lid moves 45 or 180.
+//   pulses/rev = 200 x divisor ; STEPS_PER_DEG = REV / 360
+//   1/1 200 | 1/2 400 | 1/4 800 | 1/8 1600 <-- NOW | 1/16 3200 | 1/32 6400
+// Device-verified: SW1/2/3 = OFF/ON/OFF -> 1/8; SW4/5/6 = ON/OFF/OFF -> 2.0 A;
+// motor supply 24 V.
+// Why 1/8, and why the old "1/8 stops the stepper" note was wrong: the motor was
+// SILENT, and a stalled stepper always buzzes or vibrates - silence means no coil
+// current, i.e. a current-path fault (cable, supply, ENA) or const mismatch, NOT
+// the microstep level. Real cause: DIP was at 1/8 while the firmware constant
+// stayed 1/16, so every requested angle was wrong.
+// Torque per step: 19.51% at 1/8 vs 9.80% at 1/16; detent torque alone is 5-20%
+// of holding torque, so doubling step torque matters.
+// RULE: on any DIP microstep change update these constants AND DIP_TERAKHIR,
+// then re-upload - else lid angles go silently wrong.
+// Source: Faulhaber App Note 015, docs/MENGATUR-TORSI-STEPPER.md
 const float STEPS_PER_REV = 1600.0;
 const float STEPS_PER_DEG = STEPS_PER_REV / 360.0;   // 4.4444
 
 // ------------------------------------------------------------
-//  SUDUT LID GLOBAL
+//  MICROSTEP MARKER  *** READ BEFORE CHANGING DIP ***
 // ------------------------------------------------------------
-//  Sudut bukaan yang dipakai oleh SEMUA perintah buka/tutup
-//  (perintah C/S/I, perintah O, dan tombol BUKA/TUTUP di /debug).
-//  Atur sekali, lalu seluruh sistem memakai angka yang sama.
-//
-//  Contoh: setelah diatur 45 derajat, menekan BUKA akan membuka
-//  45 derajat dan menekan TUTUP akan kembali ke 0.
+// The microstep firmware ASSUMES. Not used for math - it is COMPARED: stored to
+// flash, and a mismatch at boot means the firmware was uploaded assuming a
+// different microstep, so cached stepper speeds must be discarded.
+// Change ONLY with STEPS_PER_REV.  1/4->4 | 1/8->8 <--now | 1/16->16
+#define DIP_TERAKHIR  8
+
+// ------------------------------------------------------------
+//  GLOBAL LID ANGLE
+// ------------------------------------------------------------
+// Opening angle for ALL open/close commands (C/S/I, O, /debug buttons). 45 deg
+// means OPEN moves 45 and CLOSE returns to 0.
 const float LID_ANGLE_MIN = 1.0;
-const float LID_ANGLE_MAX = 120.0;    // batas aman mekanik
-const float LID_ANGLE_DEF = 90.0;     // dipakai kalau belum pernah diatur
+const float LID_ANGLE_MAX = 120.0;    // mechanical safety limit
+const float LID_ANGLE_DEF = 90.0;     // used if never configured
 
 float lidAngleGlobal = LID_ANGLE_DEF;
 
-// Batas maksimum posisi lid. Sama dengan sudut maksimum yang boleh
-// diatur, supaya lid tidak pernah bisa melewati batas mekanik.
+// Max lid position = max settable angle (never exceeds the mechanical limit).
 const float LID_MAX_DEG = LID_ANGLE_MAX;
 
 // ------------------------------------------------------------
-//  KECEPATAN PULSA STEPPER (step per detik)
+//  STEPPER PULSE SPEED (steps per second)
 // ------------------------------------------------------------
-//  Kalau motor BERGETAR atau berdengung tanpa berputar, itu tanda
-//  motor kehilangan sinkronisasi (stall). Penyebab paling umum:
-//    1. Level tegangan sinyal PUL kurang (TB6600 butuh ~5V, bukan 3.3V)
-//    2. Kecepatan terlalu tinggi untuk arus/tegangan driver yang ada
-//    3. Arus TB6600 di-set terlalu rendah
-//  Turunkan angka ini dulu sebelum menyalahkan hal lain.
-//
-//  Nilai aman         : 400  - 800
-//  Nilai sedang       : 800  - 1200
-//  Nilai cepat        : 1200 - 2000  (butuh sinyal 5V yang benar)
-//
-// Kecepatan stepper.
-//
-// STEP_SPEED_FAST dipakai sebagai kecepatan default saat robot menyala.
-// Nilai 1600 dipilih setelah pengujian langsung: pada semua kecepatan
-// (K300 s/d K2000) jitter maksimum hanya 2-4 us dan lid berhenti tepat
-// di 90 derajat, jadi 1600 aman dan membuka lid dalam ~0.94 detik
-// (K600 butuh 1.23 detik).
-//
-// CATATAN: pengujian dilakukan TANPA beban lid. Kalau lid punya berat
-// atau gesekan, turunkan lewat halaman /debug (tombol K900 / K600)
-// atau kirim perintah K600. Kalau lid berhenti kurang dari 90 derajat,
-// itu tanda kehilangan langkah -> turunkan kecepatan.
+// VIBRATION/buzz without turning = stalled. Causes: PUL level too low (TB6600
+// wants ~5V, not 3.3V), speed too high for the driver current, or TB6600 current
+// too low. Lower this first.
+//   safe 400-800 | medium 800-1200 | fast 1200-2000 (needs a real 5V signal)
+// 1600 from live testing: max jitter 2-4 us at every speed (K300..K2000), lid
+// stopped exactly at 90 deg (~0.94 s; K600: 1.23 s). Tested WITHOUT lid load -
+// with weight/friction lower it via /debug (K900 / K600). Stopping short of
+// 90 deg = lost steps, lower the speed.
 // ------------------------------------------------------------
-//  PROFIL KECEPATAN: SLOW / MEDIUM / FAST
+//  SPEED PROFILES: SLOW / MEDIUM / FAST
 // ------------------------------------------------------------
-//  Satu tombol di controller memilih profil, dan SATU profil mengatur
-//  dua hal sekaligus: kecepatan putar roda (PWM) dan kecepatan gerak
-//  tutup (step per detik). Ini disengaja, supaya "slow" berarti slow
-//  untuk seluruh robot, bukan hanya rodanya.
-//
-//  SLOW   : paling pelan dan paling halus. Kecepatan tutupnya sengaja
-//           jauh lebih rendah supaya tidak ada kemungkinan kehilangan
-//           langkah. Ini pilihan untuk gerakan yang harus mulus betul,
-//           dan untuk menghemat baterai.
-//  MEDIUM : seimbang, dipakai sehari-hari.
-//  FAST   : paling cepat, tapi paling berisiko kehilangan langkah kalau
-//           arus TB6600 kurang atau beban tutup berat.
-//
-//  Nilai tutup berhenti di 900 step per detik karena pengujian
-//  menunjukkan di atas itu mulai ada tanda kehilangan langkah pada
-//  beban ringan. Roda boleh lebih cepat karena motor DC tidak punya
-//  masalah sinkronisasi.
+// One button sets BOTH wheel PWM and lid speed (steps/s), so "slow" means slow
+// robot-wide. SLOW = smoothest, lid speed far lower so step loss is impossible;
+// MEDIUM = daily; FAST = riskiest if current is low or load heavy.
+// Lid speed caps at 900 steps/s: above that testing showed step loss even under
+// light load. Wheels may be faster - a DC motor has no sync problem.
 
 #define PROFIL_SLOW    0
 #define PROFIL_MEDIUM  1
 #define PROFIL_FAST    2
 
-//            nama        step/s  PWM
+// ------------------------------------------------------------
+//  WHEEL-ONLY SPEED PROFILES
+// ------------------------------------------------------------
+// IMPORTANT: drive motors only. The lid stepper has its own speed - wheels
+// (floor driving = comfort) and lid (heavy iris gear train = torque/precision)
+// are separate systems, so coupling them means changing one breaks the other.
+// Stepper speed is therefore set SEPARATELY and ignores SLOW/MEDIUM/FAST.
+//           name        wheel PWM
 struct ProfilKecepatan {
   const char* nama;
-  float       stepSps;
   uint8_t     pwmRoda;
 };
 
-// Nilai stepSps sudah disesuaikan untuk MICROSTEP 1/8, bukan 1/16.
-//
-// Sebelumnya pada microstep 1/16, 1600 step per detik berarti 0,5
-// putaran per detik pada motor. Setelah turun ke 1/8, angka yang sama
-// hanya berarti 1 putaran per detik, jadi lid bergerak DUA KALI LEBIH
-// CEPAT. Nilainya dibagi dua supaya kecepatan gerak lid tidak berubah
-// dari yang sudah kamu rasakan dan setujui.
-//           nama        step/s  PWM
 const ProfilKecepatan PROFIL[3] = {
-  { "SLOW",    200.0,   45 },
-  { "MEDIUM",  450.0,  110 },
-  { "FAST",    800.0,  200 }
+  { "SLOW",     45 },
+  { "MEDIUM",  110 },
+  { "FAST",    200 }
 };
 
 uint8_t profilAktif = PROFIL_MEDIUM;
 
-// Kecepatan stepper yang sedang berlaku, diubah dari HP/serial dengan
-// perintah 'K'. Nilai ini selalu diisi ulang saat profil berganti.
-float stepSpeedActive = PROFIL[PROFIL_MEDIUM].stepSps;
+// ------------------------------------------------------------
+//  STEPPER SPEED (INDEPENDENT OF WHEEL PROFILE)
+// ------------------------------------------------------------
+// Ignores SLOW/MEDIUM/FAST (wheel-only). Set here or via the K command; saved to
+// flash. 450 steps/s at 1/8: 1600 pulses = one rev, so ~0.28 rev/s, and a 90 deg
+// move (400 steps) takes ~0.9 s.
+// WHY NOT 600: 600 was the value at microstep 1/16. At 1/8 pulses per degree
+// HALVE, so 600 moves the lid TWICE as fast - the easiest way to lose steps on a
+// heavy iris lid. 450 matches the tested MEDIUM number at 1/8 in
+// docs/MENGATUR-TORSI-STEPPER.md.
+#define STEP_DEFAULT_SPS   450.0f
+
+// Active stepper speed. Set by the K command, saved to flash across power off.
+float stepSpeedActive = STEP_DEFAULT_SPS;
 
 // ============================================================
-//  POLARITAS SINYAL KE TB6600  *** BACA INI SEBELUM MENGUBAH ***
+//  SIGNAL POLARITY TO TB6600  *** READ BEFORE CHANGING ***
 // ============================================================
-//
-//  TB6600 memakai OPTOCOUPLER di input PUL/DIR/ENA. Supaya bekerjasama
-//  dengan benar, arus harus mengalir 10-15 mA melewati LED di dalamnya.
-//
-//  ADA DUA CARA WIRING, DAN POLARITAS FIRMWARE HARUS COCOK:
-//
-//  ------------------------------------------------------------
-//  1) COMMON-ANODE  (5V)  <-- YANG BENAR, dipakai sekarang
-//  ------------------------------------------------------------
-//     X+  (PUL+/DIR+/ENA+)  ->  5V
-//     X-  (PUL-/DIR-/ENA-)  ->  GPIO ESP32
-//     GND buck converter    ->  GND ESP32  (WAJIB disambung)
-//
-//     GPIO menarik ke LOW = arus mengalir = sinyal AKTIF.
-//     Jadi: pulsa = LOW, lalu kembali HIGH.  ->  PULSE_ACTIVE = LOW
-//
-//     Kenapa ini benar: arus datang dari rel 5V yang kuat, bukan dari
-//     pin ESP32. Optocoupler dapat 10-15 mA penuh, sinyal jadi tegas,
-//     dan motor berputar mulus.
-//
-//  ------------------------------------------------------------
-//  2) COMMON-CATHODE  (3.3V dari GPIO)  <-- MENYEBABKAN GETAR
-//  ------------------------------------------------------------
-//     X-  (PUL-/DIR-/ENA-)  ->  GND
-//     X+  (PUL+/DIR+/ENA+)  ->  GPIO
-//
-//     Arus = (3.3V - 1.2V) / 220ohm = hanya ~9.5 mA, dan itu pun
-//     naik-turun karena GPIO ESP32 tidak stabil pada arus besar.
-//     Optocoupler kadang tidak menyala -> GEJALA: motor berputar
-//     tapi TERSENDAT-SENDAT. Persis masalah yang dilaporkan.
-//
-//  ------------------------------------------------------------
-//  CARA MENGGANTI
-//  ------------------------------------------------------------
-//     Wiring common-anode 5V  ->  PULSE_ACTIVE LOW   (default)
-//     Wiring common-cathode   ->  PULSE_ACTIVE HIGH
-//
-//  Setelah mengubah, WAJIB compile+upload ulang. Jangan pernah
-//  mencampur: wiring 5V dengan firmware aktif-HIGH akan membuat
-//  motor bergerak pada waktu yang salah.
+// TB6600 has OPTOCOUPLERS on PUL/DIR/ENA: 10-15 mA must flow through the LED.
+// Two wirings; firmware polarity MUST match.
+// 1) COMMON-ANODE (5V) <-- CORRECT, in use
+//      X+ -> 5V ; X- -> GPIO ; buck GND -> ESP32 GND (required)
+//    GPIO LOW = current flows = ACTIVE, so pulse = LOW then HIGH -> PULSE_ACTIVE
+//    LOW. Current comes from the 5V rail, not the pin, so the optocoupler gets
+//    the full 10-15 mA and the motor runs smooth.
+// 2) COMMON-CATHODE (3.3V) <-- CAUSES VIBRATION
+//      X- -> GND ; X+ -> GPIO
+//    Current = (3.3V - 1.2V) / 220 ohm = only ~9.5 mA, and it sags because the
+//    ESP32 GPIO is unstable at high current, so the optocoupler sometimes fails
+//    to fire -> motor turns but STUTTERS (the reported problem).
+// Switching: common-anode -> LOW (default); common-cathode -> HIGH.
+// Always recompile+upload after changing; never mix, or the motor moves at the
+// wrong time.
 // ============================================================
 
 #define PULSE_ACTIVE   LOW    // common-anode 5V   (default)
-// #define PULSE_ACTIVE   HIGH  // common-cathode 3.3V (tidak disarankan)
+// #define PULSE_ACTIVE   HIGH  // common-cathode 3.3V (not recommended)
 
-// Turunan polaritas. Dipakai di seluruh kode supaya tidak ada nilai
-// yang ditulis langsung (hard-coded) di tempat lain.
+// Polarity derivatives, so no raw values are hard-coded elsewhere.
 #define PULSE_IDLE     (PULSE_ACTIVE == LOW  ? HIGH : LOW)
 #define PULSE_ON       (PULSE_ACTIVE)
 #define PULSE_OFF      (PULSE_IDLE)
 
-// DIR: dengan wiring common-anode, arah dibalik dibanding common-cathode.
-// Nilai ini menyesuaikan otomatis.
+// DIR: common-anode wiring inverts direction vs common-cathode.
 #define DIR_FOR_POS    (PULSE_ACTIVE == LOW ? LOW  : HIGH)
 #define DIR_FOR_NEG    (PULSE_ACTIVE == LOW ? HIGH : LOW)
 
-// ENA: motor FREE (tidak menahan) saat ENA tidak dialiri arus.
-#define ENA_ACTIVE     (PULSE_ACTIVE)      // arus mengalir = motor DIKUNCI
+// ENA: motor is FREE (not holding) when no current flows through ENA.
+#define ENA_ACTIVE     (PULSE_ACTIVE)      // current flows = motor LOCKED
 #define ENA_INACTIVE   (PULSE_ACTIVE == LOW ? HIGH : LOW)  // motor FREE
 
 // ------------------------------------------------------------
-//  MODE TAHAN (HOLD)  *** PENTING UNTUK DIAGNOSA ***
+//  HOLD MODE  *** IMPORTANT FOR DIAGNOSIS ***
 // ------------------------------------------------------------
-//  Setelah gerakan selesai, firmware normalnya MELEPAS motor (ENA off =
-//  motor free). Ini hemat daya dan motor tidak panas.
-//
-//  TAPI motor yang FREE bisa berputar sendiri karena:
-//   - beban lid menariknya (gravitasi)
-//   - getaran mekanik
-//   - sisa medan magnet
-//
-//  Gejala "motor terus berputar walau firmware sudah berhenti" bisa
-//  berasal dari ini. Kalau HOLD_MODE = true, motor TETAP DIKUNCI setelah
-//  selesai, sehingga tidak bisa berputar sendiri.
-//
-//  Cara memakai untuk diagnosa:
-//   - HOLD_MODE false (default): motor bebas setelah gerakan
-//   - HOLD_MODE true          : motor dikunci setelah gerakan
-//
-//  Kalau dengan HOLD_MODE true masalah "terus berputar" HILANG,
-//  berarti penyebabnya memang motor free + beban, bukan sinyal.
-//
-//  Bisa diubah saat berjalan lewat perintah 'H' (tanpa upload ulang):
-//     H1 -> kunci setelah gerakan
-//     H0 -> lepas setelah gerakan (default)
+// Normally the motor is RELEASED after a move (ENA off = free): saves power and
+// runs cool. But a FREE motor can turn by itself from lid load (gravity),
+// vibration, or residual magnetism - the symptom "motor keeps turning after
+// firmware stopped". HOLD_MODE true keeps it LOCKED; if that symptom DISAPPEARS
+// with it true, the cause is free motor + load, not the signal.
+// Runtime switch 'H' (no re-upload):  H1 -> lock | H0 -> release (default)
 // ------------------------------------------------------------
 bool holdMode = false;
 
-// Berapa lama motor tetap dikunci setelah gerakan selesai (ms).
-// 0 = selamanya (sampai perintah berikutnya). Dipakai kalau holdMode true
-// dan kita ingin motor hanya dikunci sebentar saja.
+// How long the motor stays locked after a move (ms). 0 = until the next command.
 #define HOLD_TIMEOUT_MS  0
 
-// ==================== KONSTANTA MOTOR ====================
+// ==================== MOTOR CONSTANTS ====================
 
 uint8_t speedPWM = 140;
 const uint32_t PWM_FREQ = 20000;
@@ -400,11 +295,11 @@ BLECharacteristic* charTX          = nullptr;
 bool               bleConnected    = false;
 
 // ==================== STATE ====================
-// (struct Stepper sudah didefinisikan di atas, dekat WebServer)
+// (struct Stepper is defined above, near WebServer)
 
-// Instance stepper dibuat di sini karena butuh konstanta pin LID_*.
-// Dipakai designated initializer (.field = ...) supaya urutan field tidak
-// mudah salah kalau struct berubah lagi.
+// Built here because they need the LID_* pin constants. Designated
+// initializers (.field = ...) so field order cannot silently break if the
+// struct changes again.
 Stepper stLidLeft = {
   .pinPul = LID_L_PUL, .pinDir = LID_L_DIR, .pinEna = LID_L_ENA,
   .currentStep = 0, .targetStep = 0, .dir = 0, .moving = false,
@@ -419,43 +314,16 @@ Stepper stLidRight = {
   .speedCurrent = 0, .speedTarget = 0, .pulseHigh = false, .enabled = false
 };
 
-// ==================== MOTOR DC ====================
-//
-//  ------------------------------------------------------------
-//  KENAPA BELOK DULU TERASA SEPERTI SALAH SATU MOTOR TIDAK JALAN
-//  ------------------------------------------------------------
-//
-//  Versi lama memakai SATU nilai PWM untuk kedua roda, dan itulah
-//  sumber masalahnya. Ada dua sebab, dan keduanya nyata:
-//
-//  1. SETIAP MOTOR PUNYA TITIK MULAI BERBEDA.
-//     Motor DC tidak mulai berputar di PWM yang sama. Satu motor
-//     mungkin mulai bergerak di PWM 70, pasangannya baru di PWM 100.
-//     Akibatnya pada PWM rendah, satu roda sudah berputar sementara
-//     yang lain masih diam — persis gejala "ada motor yang seperti
-//     tidak jalan". Ini paling terasa saat berbelok, karena di situ
-//     kedua roda memang harus berlawanan arah dan torsi bebannya
-//     paling berat: seluruh berat robot diseret memutar, bukan
-//     didorong lurus.
-//
-//  2. BELOK ADALAH KONDISI PALING BERAT, TAPI MEMAKAI PWM YANG SAMA.
-//     Saat berbelok, robot harus mengalahkan gesekan roda terhadap
-//     lantai. Beban ini jauh lebih besar daripada saat maju. Kalau
-//     PWM-nya sama dengan PWM maju, motor yang titik mulainya lebih
-//     tinggi akan tertahan dan berhenti, sementara pasangannya jalan.
-//
-//  PERBAIKANNYA:
-//  - Tiap roda punya nilai PWM sendiri (pwmKiri / pwmKanan), sehingga
-//    ketidakseimbangan antar motor bisa dikompensasi.
-//  - Belok memakai PWM lebih tinggi daripada maju, karena bebannya
-//    memang lebih berat. Ini yang membuat putaran di tempat jadi
-//    lancar, bukan tersendat.
-//  - Nilai kompensasi bisa disetel dari HP lewat halaman /setting
-//    dan disimpan di flash.
-//
-//  Arah putar tiap roda ditentukan oleh motorBalikKiri /
-//  motorBalikKanan, jadi "putar di tempat" berlaku untuk roda mana
-//  pun, tidak peduli bagaimana kabelnya terpasang.
+
+// ==================== DC MOTOR ====================
+
+// Each wheel gets its own PWM value. DC motors do not start at the same PWM:
+// one may spin from 70 while its partner needs 100. At low PWM that looks like
+// "one motor does nothing", and it is worst when pivoting, because both wheels
+// fight the floor and the whole robot's weight is being dragged sideways.
+// Pivoting also uses a higher PWM than forward motion for the same reason.
+// Per-wheel compensation and the pivot boost are both settable from /setting
+// and saved to flash.
 
 void motorBegin() {
   pinMode(M_LEFT_D1,  OUTPUT);
@@ -463,7 +331,7 @@ void motorBegin() {
   pinMode(M_RIGHT_D1, OUTPUT);
   pinMode(M_RIGHT_D2, OUTPUT);
 
-  // API PWM baru (core esp32 >= 3.0); ledcSetup/ledcAttachPin sudah dihapus.
+  // New PWM API (core esp32 >= 3.0); ledcSetup/ledcAttachPin were removed.
   ledcAttach(M_LEFT_PWM,  PWM_FREQ, PWM_RES);
   ledcAttach(M_RIGHT_PWM, PWM_FREQ, PWM_RES);
 
@@ -487,63 +355,41 @@ void motorSideDrive(uint8_t pinPWM, uint8_t pinD1, uint8_t pinD2,
   }
 }
 
-// ------------------------------------------------------------
-//  PEMBALIK ARAH MOTOR
-// ------------------------------------------------------------
-//  Kalau kabel motor terpasang terbalik, robot akan bergerak ke arah
-//  yang berlawanan dengan tombolnya (tekan MAJU tapi robot mundur).
-//  Daripada membongkar kabel, arahnya dibalik di perangkat lunak.
-//
-//  Setel lewat halaman /setting, atau lewat perintah Serial:
-//     YL1  -> balik arah motor KIRI
-//     YL0  -> kembalikan ke normal
-//     YR1 / YR0 -> sama untuk motor KANAN
-//
-//  Nilainya disimpan di memori flash, jadi tetap tersimpan setelah
-//  ESP32 dimatikan.
+// Per-motor direction invert: if the wiring is backwards the robot drives
+// opposite to the button. Flip it here instead of rewiring.
+//   YL1 / YL0  -> invert / restore left
+//   YR1 / YR0  -> same for right
+// Saved to flash, so it survives a power cut.
 bool motorBalikKiri  = false;
 bool motorBalikKanan = false;
 
-// ------------------------------------------------------------
-//  KOMPENSASI PWM PER RODA
-// ------------------------------------------------------------
-//  0 berarti tidak ada kompensasi, dan nilai di atas 0 berarti roda
-//  itu diberi PWM lebih tinggi daripada roda pasangannya.
-//
-//  Pakai ini kalau saat MAJU robot tidak lurus, atau saat berputar
-//  di tempat salah satu roda terlihat lebih lambat. Naikkan angka
-//  untuk roda yang lemah, bukan turunkan roda yang kuat, supaya
-//  tenaga robot tidak berkurang.
+// Per-wheel PWM compensation. 0 = none, positive = this wheel gets more PWM
+// than its partner. Use it when the robot does not drive straight, or when one
+// wheel looks slower while pivoting. Raise the weak wheel's value rather than
+// lowering the strong one, so the robot does not lose power.
 int8_t pwmKompensasiKiri  = 0;
 int8_t pwmKompensasiKanan = 0;
 
-// Batas kompensasi, supaya salah setel tidak membuat roda diberi
-// PWM jauh di atas batas aman driver.
+// Cap so a bad setting cannot push the driver far past its safe PWM.
 const int8_t KOMPENSASI_MAKS = 60;
 
-// ------------------------------------------------------------
-//  TAMBAHAN PWM SAAT BERBELOK
-// ------------------------------------------------------------
-//  Berbelok menyeret roda ke samping, jadi bebannya lebih berat
-//  daripada maju. Tanpa tambahan ini, robot cenderung diam atau
-//  tersendat saat berputar di tempat.
-//
-//  Nilainya bisa diatur, dan disimpan di flash.
+// Extra PWM while pivoting, since dragging wheels sideways is heavier than
+// driving forward. Without it the robot tends to stall or judder on the spot.
 uint8_t tambahanBelok = 45;
 
-// Batas atas, supaya driver dan motor tetap aman.
+// Upper bound to keep driver and motor safe.
 const uint8_t TAMBAHAN_BELOK_MAKS = 90;
 
-// Hitung PWM akhir untuk satu roda, sudah termasuk kompensasi dan
-// tambahan belok. Hasilnya selalu dibatasi 0 sampai 255.
+// Final PWM for one wheel, including compensation and pivot boost.
+// Result is always clamped to 0..255.
 uint8_t motorPwmUntuk(bool sisiKiri, bool sedangBelok) {
   int nilai = (int)speedPWM;
 
   nilai += sisiKiri ? (int)pwmKompensasiKiri
                     : (int)pwmKompensasiKanan;
 
-  // Tambahan belok hanya diberikan kalau PWM dasarnya memang tidak nol.
-  // Kalau pengguna sengaja menyetel PWM 0, robot harus tetap diam.
+  // Pivot boost only applies when the base PWM is non-zero, so a deliberate
+  // PWM of 0 still means stop.
   if (sedangBelok && speedPWM > 0) nilai += (int)tambahanBelok;
 
   if (nilai < 0)   nilai = 0;
@@ -562,15 +408,13 @@ void motorStop() {
 }
 
 void motorApply() {
-  // Belok dan mundur memang memutar roda ke arah yang berbeda dari
-  // roda pasangannya, jadi PWM-nya dihitung per roda.
+  // Pivot turns the wheels against each other, so PWM is computed per wheel.
   const bool belok = (moveMode == MOVE_LEFT || moveMode == MOVE_RIGHT);
 
   const uint8_t pL = motorPwmUntuk(true,  belok);
   const uint8_t pR = motorPwmUntuk(false, belok);
 
   switch (moveMode) {
-    // --- MAJU: kedua roda berputar ke arah yang sama ---
     case MOVE_FWD:
       motorSideDrive(M_LEFT_PWM,  M_LEFT_D1,  M_LEFT_D2,
                      !motorBalikKiri,  motorBalikKiri,  pL);
@@ -578,7 +422,6 @@ void motorApply() {
                      !motorBalikKanan, motorBalikKanan, pR);
       break;
 
-    // --- MUNDUR: kebalikan dari maju ---
     case MOVE_BACK:
       motorSideDrive(M_LEFT_PWM,  M_LEFT_D1,  M_LEFT_D2,
                      motorBalikKiri,  !motorBalikKiri,  pL);
@@ -586,8 +429,7 @@ void motorApply() {
                      motorBalikKanan, !motorBalikKanan, pR);
       break;
 
-    // --- PUTAR DI TEMPAT KE KIRI ---
-    // Roda kiri mundur, roda kanan maju. Robot berputar pada porosnya.
+    // Pivot left: left wheel back, right wheel forward.
     case MOVE_LEFT:
       motorSideDrive(M_LEFT_PWM,  M_LEFT_D1,  M_LEFT_D2,
                      motorBalikKiri,  !motorBalikKiri,  pL);
@@ -595,8 +437,7 @@ void motorApply() {
                      !motorBalikKanan, motorBalikKanan, pR);
       break;
 
-    // --- PUTAR DI TEMPAT KE KANAN ---
-    // Kebalikan dari putar kiri.
+    // Pivot right: mirror of pivot left.
     case MOVE_RIGHT:
       motorSideDrive(M_LEFT_PWM,  M_LEFT_D1,  M_LEFT_D2,
                      !motorBalikKiri,  motorBalikKiri,  pL);
@@ -611,64 +452,42 @@ void motorApply() {
 }
 
 // ==================== STEPPER ====================
-//
-// ============================================================
-//  ARSITEKTUR ANTI-JITTER
-// ============================================================
-//
-//  MASALAH (terukur pada board ini):
-//  Versi awal mengeluarkan pulsa dari loop(). loop() tersendat oleh WiFi,
-//  sehingga pulsa stepper berhenti sesaat -> motor tersentak (jitter).
-//  Bahkan dengan hardware timer di core WiFi, jitter maksimum terukur
-//  mencapai 1156 us dengan 215 dari 3128 pulsa terlambat >50 us.
-//
-//  SOLUSI:
-//  Pulsa dikeluarkan oleh TASK TERSENDIRI yang di-PIN ke CORE 1.
-//  WiFi/HTTP Arduino berjalan di CORE 0, jadi keduanya tidak saling
-//  mengganggu. Ini yang membuat gerakan halus.
-//
-//  Lihat stepperTaskCore1() di bawah.
-//
-//  Catatan getar (stall): motor stepper tidak bisa langsung dari 0 ke
-//  kecepatan tinggi. Karena itu tetap ada RAMP bertahap.
-//
-//  Catatan ESP_TIMER_ISR: TIDAK TERSEDIA di build Arduino core 3.3.12,
-//  karena header membungkusnya dengan
-//      #if CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD
-//  dan opsi itu tidak diaktifkan. Karena itu dipakai task core-pinned.
 
-// Core tempat task stepper berjalan. WiFi/HTTP memakai core 0.
+// Pulses are emitted by a task pinned to core 1, while WiFi/HTTP run on core 0,
+// so HTTP requests cannot delay a pulse. Emitting from loop() measured up to
+// 1156 us of jitter with 215 of 3128 pulses late; a hardware timer on the WiFi
+// core was no better. Steppers also cannot jump from 0 to full speed, hence the
+// ramp.
+//
+// ESP_TIMER_ISR is NOT available in Arduino core 3.3.12: the header guards it
+// behind CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD, which is not enabled.
+// That is why this uses a core-pinned task instead.
+
+// Core the stepper task runs on. WiFi/HTTP use core 0.
 #define STEPPER_CORE  1
 
-// ------------------------------------------------------------
-//  PELACAK RESET  (penting untuk diagnosa gerakan tersendat)
-// ------------------------------------------------------------
-//  Kalau gerakan tersendat-sendat padahal statistik jitter bersih,
-//  kemungkinan besar ESP32 RESET di tengah gerakan (brownout karena
-//  noise motor). Saat reset, semua statistik ikut ter-nol-kan sehingga
-//  masalahnya tidak terlihat.
+// Reset tracking. If motion stutters while the jitter stats look clean, the
+// ESP32 probably reset mid-move (brownout from motor noise), and a reset zeroes
+// every counter, hiding the evidence.
 //
-//  Cara mendeteksi: simpan penghitung di RTC memory yang TIDAK hilang
-//  saat reset biasa (hanya hilang kalau daya benar-benar putus).
-//  Setiap boot, penghitung dinaikkan. Kalau > 1, berarti sudah pernah
-//  reset tanpa daya putus = indikasi kuat brownout.
-// ------------------------------------------------------------
+// Detection: keep a counter in RTC memory, which survives a normal reset and is
+// lost only when power actually drops. Increment on each boot; a value above 1
+// means a reset happened without a power cut, which points at brownout.
 
-// Angka ajaib penanda bahwa RTC memory memang berisi data kita.
+// Magic marker proving RTC memory holds our data.
 #define RTC_MAGIC 0x54524231UL   // "TRB1"
 
 RTC_NOINIT_ATTR uint32_t rtcMagic;
 RTC_NOINIT_ATTR uint32_t rtcBootCount;
-RTC_NOINIT_ATTR uint32_t rtcMoveInterrupted;  // gerakan yang terputus reset
+RTC_NOINIT_ATTR uint32_t rtcMoveInterrupted;  // move cut short by a reset
 
-// Alasan reset terakhir (dari ESP32)
 uint32_t bootResetReason = 0;
 uint32_t bootCount       = 1;
 uint32_t moveInterrupted = 0;
 bool     brownoutSuspect = false;
 bool     crashSuspect    = false;
 
-// Nama alasan reset ESP-IDF -> teks yang bisa dibaca
+// Readable names for the ESP-IDF reset reasons.
 static const char* resetReasonName(uint32_t r) {
   switch (r) {
     case 1:  return "POWERON (daya baru masuk)";
@@ -685,16 +504,16 @@ static const char* resetReasonName(uint32_t r) {
   }
 }
 
-// Dipanggil paling awal di setup(). Membaca alasan reset dan menghitung
-// berapa kali boot tanpa daya putus.
+// Called first thing in setup(): reads the reset reason and counts boots
+// without a power cut.
 void resetTrackerBegin() {
   bootResetReason = (uint32_t)esp_reset_reason();
 
   if (rtcMagic == RTC_MAGIC) {
-    // RTC memory masih valid -> ini reset TANPA daya putus
+    // RTC memory still valid -> reset WITHOUT a power cut
     rtcBootCount++;
   } else {
-    // Daya benar-benar baru masuk
+    // Power genuinely came back on
     rtcMagic        = RTC_MAGIC;
     rtcBootCount    = 1;
     rtcMoveInterrupted = 0;
@@ -703,46 +522,37 @@ void resetTrackerBegin() {
   bootCount       = rtcBootCount;
   moveInterrupted = rtcMoveInterrupted;
 
-  // Brownout dicurigai kalau: reset karena tegangan turun, ATAU sudah
-  // lebih dari 1 kali boot tanpa daya putus sementara tidak ada upload.
   brownoutSuspect = (bootResetReason == 9);
 
-  // Crash (PANIC) atau watchdog juga membuat gerakan terputus. Ini
-  // dibedakan dari brownout supaya saran perbaikannya tepat.
+  // A panic or watchdog reset also cuts motion short. Reported separately from
+  // brownout so the advice differs.
   crashSuspect = (bootResetReason == 4) ||
                  (bootResetReason == 5) ||
                  (bootResetReason == 6) ||
                  (bootResetReason == 7);
-
-  // Catat ke log (log mungkin masih kosong di sini, jadi dipanggil
-  // setelah log siap - lihat setup()).
+  // Logging happens in setup(), where the log buffer already exists.
 }
 
-// Dipanggil saat gerakan stepper dimulai. Kalau ESP32 reset di tengah
-// gerakan, penanda ini masih ada di RTC memory saat boot berikutnya.
+// Set when a move starts. If the ESP32 resets mid-move, this marker is still in
+// RTC memory on the next boot.
 void markMoveStart() {
   rtcMoveInterrupted = 1;
 }
 
-// Dipanggil saat gerakan selesai dengan benar.
+// Cleared when a move finishes normally.
 void markMoveEnd() {
   rtcMoveInterrupted = 0;
 }
 
-// ============================================================
-//  PENGUKUR DURASI GERAKAN  (mendeteksi KEHILANGAN LANGKAH)
-// ============================================================
+// Move-duration measurement, used to detect lost steps.
 //
-//  Kalau firmware mengirim 800 pulsa pada 1600 step/s, gerakan
-//  seharusnya selesai dalam waktu tertentu. Kita ukur waktu AKTUAL
-//  lalu hitung kecepatan rata-rata nyata.
+// Sending 400 pulses at 800 steps/s should take a predictable time. Compare the
+// actual elapsed time against the commanded average speed: a real average far
+// below the requested one means pulses are not coming out as ordered.
 //
-//  Kalau rata-rata jauh di bawah yang diminta, artinya pulsa tidak
-//  keluar serapi yang diperintahkan -> bisa kehilangan langkah.
-//
-//  Ini mengukur dari sisi firmware saja. Motor tetap bisa kehilangan
-//  langkah MEKANIK (kopling selip) yang tidak terlihat di sini.
-//  Tapi kalau angkanya cocok, perintah pulsanya memang rapi.
+// This only sees the firmware side. The motor can still lose steps mechanically
+// (a slipping coupler) without showing up here, but matching numbers do prove
+// the pulse train itself is clean.
 
 volatile unsigned long gMoveStartUs   = 0;
 volatile unsigned long gMoveEndUs     = 0;
@@ -751,79 +561,64 @@ volatile float         gMoveLastSpeed = 0.0f;
 volatile uint32_t      gMoveCount     = 0;
 volatile uint32_t      gMoveStepsAtStart = 0;
 
-// ---- Pelacak PRESISI gerakan ----
-// Setiap kali perintah BUKA atau TUTUP selesai, selisih antara posisi
-// yang diminta dan posisi yang benar-benar dicapai dicatat di sini.
-// Kalau selisihnya selalu 0, gerakannya presisi dan konsisten.
-// Kalau ada selisih, jumlahnya terlihat jelas, tidak hanya dirasakan.
-volatile uint32_t gMoveReqSteps       = 0;   // langkah yang diminta gerakan terakhir
-volatile int32_t  gPresisiMaksSelisih = 0;   // selisih terbesar yang pernah terjadi
-volatile uint32_t gPresisiUji         = 0;   // berapa kali diuji
-volatile uint32_t gPresisiGagal       = 0;   // berapa kali meleset
+// Move precision tracker: after each OPEN or CLOSE, records the gap between the
+// commanded position and the position actually reached. A gap of 0 every time
+// means the move is consistent; a non-zero one quantifies the drift instead of
+// leaving it to feel.
+volatile uint32_t gMoveReqSteps       = 0;   // steps requested by the last move
+volatile int32_t  gPresisiMaksSelisih = 0;   // largest gap ever seen
+volatile uint32_t gPresisiUji         = 0;   // how many moves tested
+volatile uint32_t gPresisiGagal       = 0;   // how many missed
 
-// Total pulsa yang keluar dari semua motor, sejak boot.
-// Dideklarasikan di sini karena dipakai oleh pengukur durasi gerakan.
+// Total pulses emitted by all motors since boot.
 volatile uint32_t stepTotal = 0;
 
-// Pengukur perioda pulsa AKTUAL: berapa mikrodetik jarak antar-pulsa
-// yang BENAR-BENAR terjadi. Ini memisahkan "pulsa tidak rapi" (jitter)
-// dari "pulsa keluar terlalu jarang" (perioda terlalu panjang).
+// Measured inter-pulse period in microseconds, which separates "irregular
+// pulses" (jitter) from "pulses too infrequent" (period too long).
 volatile uint32_t gPeriodMaxUs = 0;
 volatile uint32_t gPeriodMinUs = 0xFFFFFFFF;
 volatile uint32_t gPeriodSumUs = 0;
 volatile uint32_t gPeriodCount = 0;
 volatile uint32_t gPeriodLastUs = 0;
 
-// Pelacak LONJAKAN: satu pulsa yang tertahan jauh lebih lama dari jadwal.
-// Inilah penyebab "tersendat-sendat" - motor maju, macet sejenak, maju lagi.
-// Kalau rata-rata selisih kecil tapi 'max' besar, berarti pulsanya rapi
-// TAPI ada macet sesekali, dan itu terasa sebagai sentakan.
-volatile uint32_t gLonjakCount          = 0;   // berapa kali macet >500us
-volatile uint32_t gLonjakPertamaPulsa   = 0;   // pulsa ke-berapa macet pertama
-volatile uint32_t gLonjakPertamaUs      = 0;   // besar macet pertama (us)
-volatile uint32_t gLonjakPosisiStep     = 0;   // step saat macet pertama
+// Spike tracker: one pulse held far longer than scheduled. That is what makes
+// motion stutter. A small average with a large max means clean pulses with
+// occasional stalls, which is felt as a lurch.
+volatile uint32_t gLonjakCount          = 0;   // stalls >500us
+volatile uint32_t gLonjakPertamaPulsa   = 0;   // which pulse stalled first
+volatile uint32_t gLonjakPertamaUs      = 0;   // size of first stall (us)
+volatile uint32_t gLonjakPosisiStep     = 0;   // step at first stall
 volatile uint32_t gLonjakTerbesarUs     = 0;
 volatile uint32_t gLonjakTerbesarStep   = 0;
 
-// ============================================================
-//  SAKLAR UJI: kenapa perioda pulsa jadi terlalu panjang?
-// ============================================================
+// Diagnostic switches for "why is the period too long?"
 //
-//  Temuan TERUKUR (bukti, bukan dugaan):
-//    min perioda = 599 us        -> spin loop CEPAT, pulsa BISA tepat waktu
-//    max perioda = 5135-32368 us -> kadang tertunda 8-50x
-//    rata-rata   = 2-3x jadwal   -> 884 step/s padahal diminta 1600
+// Measured evidence: min period 599 us (so the spin loop is fast enough to hit
+// the schedule), but max 5135-32368 us, or 8-50x late, averaging 2-3x the
+// schedule (884 steps/s against a requested 1600). Since the minimum is correct,
+// something outside core 1 is interfering.
 //
-//  Karena 'min' sudah benar, spin loop-nya tidak lambat. Yang membuat
-//  perioda panjang adalah gangguan dari luar core 1.
+//   bleOff             -> turn BLE off. BLE shares radio and flash with WiFi,
+//                         and a flash access can stall the whole chip; 32 ms is
+//                         typical of one flash operation.
+//   tickHanyaMotorAktif -> only tick motors that are moving, lightening the loop.
 //
-//  Dua saklar untuk memisahkan penyebab:
-//
-//  1. bleOff -> matikan BLE. BLE memakai radio + flash bersama WiFi,
-//     dan akses flash bisa menahan SELURUH chip (cache stall).
-//     32 ms yang muncul di 'max' itu khas durasi satu operasi flash.
-//
-//  2. tickHanyaMotorAktif -> di spin loop hanya panggil stepperTick
-//     untuk motor yang SEDANG bergerak, mengurangi beban loop.
-//
-//  Kendali lewat perintah 'X':
-//     XB1 -> matikan BLE      XB0 -> hidupkan BLE
-//     XT1 -> tick motor aktif saja    XT0 -> tick keduanya
+// Controlled by command 'X':
+//   XB1 / XB0  BLE off / on       XT1 / XT0  active motor only / both
 bool bleOff              = false;
 bool tickHanyaMotorAktif = false;
 
-// Pembungkus BLE advertising. Dipisah sebagai fungsi supaya bisa
-// dipanggil dari perintah 'X' tanpa menyalin kode inisialisasi.
-// (definisi aslinya ada di dekat setup(); ini hanya deklarasinya)
+// BLE advertising wrappers, so command 'X' can call them without duplicating
+// the init code. (Definitions live near setup(); these are declarations.)
 void BLEAdvertising_stop();
 void BLEAdvertising_start();
 
 void markMoveStartTimed() {
   gMoveStartUs      = micros();
-  gMoveStepsAtStart = stepTotal;   // patokan untuk menghitung pulsa
+  gMoveStepsAtStart = stepTotal;   // baseline for counting pulses
   gMoveCount++;
 
-  // Nol-kan pelacak jadwal & lonjakan untuk gerakan ini
+  // Clear schedule and spike trackers for this move
   gPeriodMaxUs        = 0;
   gPeriodMinUs        = 0xFFFFFFFF;
   gPeriodSumUs        = 0;
@@ -843,72 +638,102 @@ void markMoveEndTimed(uint32_t steps, float speed) {
   gMoveLastSpeed = speed;
 }
 
-// ------------------------------------------------------------
-//  RAMP AKSELERASI
-// ------------------------------------------------------------
-//  PENTING: panjang ramp TIDAK boleh angka tetap. Kalau tetap, pada
-//  kecepatan rendah ramp menempati hampir seluruh gerakan dan motor
-//  stall di akhir. Terbukti dari pengujian: pada K300 lid berhenti di
-//  84 derajat (bukan 90) sementara K600-K1600 berhenti tepat di 90.
+// Ramp length must NOT be a fixed number. A fixed ramp ate almost the whole
+// move at low speed and the motor stalled at the end: at K300 the lid stopped at
+// 84 degrees instead of 90, while K600-K1600 landed exactly on 90. Ramp length
+// is now proportional to speed (speed x 0.5), clamped to the bounds below.
 //
-//  Sekarang panjang ramp proporsional: kecepatan x 0.5, dibatasi
-//  antara RAMP_MIN_STEPS dan RAMP_MAX_STEPS.
-//
-//  CATATAN UNTUK MICROSTEP 1/8:
-//  Angka di bawah ini disesuaikan saat firmware masih memakai
-//  microstep 1/16, dan pada dasarnya tidak perlu diubah, karena
-//  panjang ramp diukur dalam JUMLAH LANGKAH, bukan dalam putaran.
-//  Yang berubah hanyalah berapa derajat yang ditempuh tiap langkah.
-//
-//  Tetapi ada satu hal yang perlu disadari: pada microstep 1/8, satu
-//  langkah sekarang menempuh sudut dua kali lebih besar. Jadi ramp
-//  yang sama panjangnya kini mencakup sudut dua kali lebih lebar.
-//  Untuk beban berat ini justru menguntungkan, karena akselerasi jadi
-//  lebih landai dan motor lebih kecil kemungkinan kehilangan langkah
-//  di awal gerakan.
-#define RAMP_MIN_STEPS    150.0f   // ramp terpendek
-#define RAMP_MAX_STEPS    800.0f   // ramp terpanjang
+// At microstep 1/8 a 90 degree move is 400 steps, half of the 1/16 figure, so
+// RAMP_MAX_STEPS is 400. At 1/16 the 800 bound made sense because a 90 degree
+// move really is 800 steps; at 1/8 a bound of 800 would spend the entire move on
+// acceleration and deceleration and never reach full speed.
+#define RAMP_MIN_STEPS    100.0f   // shortest ramp
+#define RAMP_MAX_STEPS    400.0f   // longest ramp (one 90 deg move at 1/8)
 
-// Lantai deselerasi: saat mendekati tujuan, kecepatan tidak turun di
-// bawah fraksi ini dari kecepatan target. Terlalu kecil = stall.
+// Deceleration floor: near the target, speed never drops below this fraction of
+// the target speed. Too small and the motor stalls.
 #define SLOW_FLOOR_FRAC   0.35f
 
-// Kecepatan minimum pulsa. Di bawah ini motor stepper cenderung
-// kehilangan torsi, jadi dijaga di atas nilai ini.
-#define SPEED_MIN_SPS     100.0f
+// Minimum pulse speed. Below this a stepper tends to lose torque, so it is kept
+// above that value. This number is critical: it once made the stepper stop dead.
+//
+// The ramp raises speed gradually, but starting from zero makes the first step
+// infinitely long, so the initial speed is forced up to this value.
+//
+// What went wrong before: this was 100. With the stepper running at 200 steps/s
+// that floor was half the target, so the motor jumped 0 -> 100 with no
+// acceleration. A jump that large loses every step: the motor just buzzes. Every
+// open/close command looked like no response at all.
+//
+// Safe rule: this must be small relative to the lowest stepper speed in use. The
+// default is 450, so 60 is about a seventh and safe. The static_assert below and
+// the runtime clamp both enforce it.
+//
+// Why 100 became 60: at microstep 1/8 the slowest profile is SLOW at 200
+// steps/s. A floor of 100 is half the target, too close, so the motor jumps from
+// standstill to 100 without enough acceleration. At 60 the floor is 30 percent of
+// 200, leaving the ramp room to work in the SLOW profile.
+#define SPEED_MIN_SPS     60.0f
 
-// Lebar pulsa minimum untuk TB6600. Datasheet: minimal 2.2 us.
-// Kita pakai 10 us supaya aman dengan overhead di dalam timer.
-const unsigned long PULSE_MIN_US = 10;
+// Compile-time guard: refuse to build if the floor exceeds a quarter of the
+// default stepper speed. Lowering STEP_DEFAULT_SPS without adjusting
+// SPEED_MIN_SPS then fails at compile time rather than after an upload, where it
+// would show up only as a silent, motionless stepper.
+static_assert(SPEED_MIN_SPS <= (STEP_DEFAULT_SPS / 4.0f),
+              "SPEED_MIN_SPS terlalu besar dibanding STEP_DEFAULT_SPS. "
+              "Turunkan SPEED_MIN_SPS, kalau tidak stepper akan diam total "
 
-// ---- Jitter monitor ----
-// Mengukur berapa besar penyimpangan waktu antar-pulsa. Kalau angka ini
-// besar, berarti ada sesuatu yang mengganggu timer (biasanya beban CPU).
-volatile uint32_t jitMaxUs   = 0;    // penyimpangan terburuk (us)
-volatile uint32_t jitSumUs   = 0;    // total penyimpangan (untuk rata-rata)
-volatile uint32_t jitCount   = 0;    // jumlah sampel
-volatile uint32_t jitLateCnt = 0;    // berapa kali pulsa terlambat >50us
+              "karena dipaksa melompat dari diam tanpa akselerasi.");
 
-// ------------------------------------------------------------
-//  PELACAK ARAH  (untuk mendiagnosa "buka & tutup searah")
-// ------------------------------------------------------------
-//  Kalau lid pernah bergerak naik DAN turun, berarti DIR bekerja.
-//  Kalau hanya satu arah, berarti sinyal DIR tidak sampai ke TB6600.
-//  Penanda ini di-set di executeCommand saat perintah lid diterima,
-//  bukan dari gerakan fisik (kita tidak punya sensor).
-volatile bool gMovedUp   = false;   // pernah diperintahkan ke posisi lebih besar
-volatile bool gMovedDown = false;   // pernah diperintahkan ke posisi lebih kecil
+// Minimum pulse width for the TB6600.
+//
+// The TB6600HG chip only specifies twCLKH/twCLKL as 2.2 us, so 10 us is legal at
+// the chip level. But ready-made TB6600 modules add an optocoupler stage in front
+// of the chip, and an optocoupler has rise and fall times. A pulse that is too
+// narrow may not register as a full pulse.
+//
+// What this fixed: the value was 10 us. At 600 steps/s the total period is
+// 833 us, so the active pulse was only 1.2 percent of it. The motor responded
+// with a very faint hum audible only with an ear against it, and the body got
+// slightly warm: coils energised, but the driver never saw a full pulse, so the
+// motor did not turn. 20 us gives twice the margin.
+//
+// The project research already flagged this as something to check on the device
+// rather than assume from the chip datasheet.
+const unsigned long PULSE_MIN_US = 20;
+
+// Pulse width is also made proportional to the period. At low speed the period
+// is long, and a flat 20 us inside a 2000 us period is still too narrow for some
+// optocouplers. This is the percentage of the period used as the active pulse:
+// 15 percent is wide enough for a slow optocoupler and leaves 85 percent idle, so
+// the driver can still tell the rising and falling edges apart. At 600 steps/s
+// the period is 833 us, giving a pulse of about 125 us instead of 10.
+const unsigned long PULSE_DUTY_PERSEN = 15;
+
+// Jitter monitor: how far pulses drift from their schedule. A large value means
+// something (usually CPU load) is disturbing the timer.
+volatile uint32_t jitMaxUs   = 0;    // worst deviation (us)
+volatile uint32_t jitSumUs   = 0;    // total deviation (for the average)
+volatile uint32_t jitCount   = 0;    // sample count
+volatile uint32_t jitLateCnt = 0;    // pulses late by >50us
+
+// Direction tracker, for diagnosing "opens and closes the same way". If the lid
+// has been commanded both up and down, DIR works. One direction only means DIR
+// is not reaching the TB6600. Set when the command is received, not from physical
+// motion, since there is no sensor.
+volatile bool gMovedUp   = false;   // commanded to a larger angle
+volatile bool gMovedDown = false;   // commanded to a smaller angle
 
 void stepperBegin(Stepper &s) {
   pinMode(s.pinPul, OUTPUT);
   pinMode(s.pinDir, OUTPUT);
   pinMode(s.pinEna, OUTPUT);
-  // Pakai PULSE_IDLE, bukan LOW langsung, supaya polaritas mengikuti
-  // PULSE_ACTIVE. Penting: kalau idle salah, optocoupler bisa teraliri
-  // terus dan motor panas / bergetar.
+  // Use PULSE_IDLE rather than a literal LOW so polarity follows PULSE_ACTIVE.
+  // A wrong idle level can keep the optocoupler energised, heating and buzzing
+  // the motor.
   digitalWrite(s.pinPul, PULSE_IDLE);
   digitalWrite(s.pinDir, DIR_FOR_POS);
-  digitalWrite(s.pinEna, ENA_INACTIVE);   // mulai FREE, motor tidak panas
+  digitalWrite(s.pinEna, ENA_INACTIVE);   // start FREE, motor stays cool
   s.enabled      = false;
   s.moving       = false;
   s.speedCurrent = 0;
@@ -920,51 +745,54 @@ void stepperEnable(Stepper &s, bool on) {
   s.enabled = on;
 }
 
-// Lepas motor setelah gerakan selesai, TAPI hormati holdMode.
+// Must be called EVERY time a move starts (s.moving = true).
 //
-// Dipakai di semua tempat yang dulu memanggil stepperEnable(s, false)
-// setelah gerakan. Kalau holdMode true, motor tetap dikunci sehingga
-// tidak bisa berputar sendiri karena beban/gravitasi.
-//
-// Ini juga jalur diagnosa: kalau gejala "terus berputar" hilang saat
-// holdMode true, berarti penyebabnya motor free + beban, bukan sinyal.
+// stepperTick uses s.halfPeriodUs to decide when the next pulse is due. If it is
+// still 0 from struct initialisation, two things happen and both make the motor
+// look dead: the first pulse fires immediately (elapsed 0 >= 0), and then
+// halfPeriodUs is derived from a speed that is ramping up from zero, giving
+// periods of hundreds of milliseconds. This fills halfPeriodUs from a valid
+// starting speed (the ramp floor, or the target if lower), so the first two pulses
+// already keep the right schedule.
+void stepperPrimePeriod(Stepper &s, float speedSps) {
+  float spsAwal = SPEED_MIN_SPS;
+  if (spsAwal > speedSps) spsAwal = speedSps;    // do not exceed the target
+  if (spsAwal < 1.0f)     spsAwal = 1.0f;        // avoid divide by zero
+
+  s.halfPeriodUs = (unsigned long)(500000.0f / spsAwal);
+
+  // The pulse width must still fit inside the period.
+  if (s.halfPeriodUs < (PULSE_MIN_US + 2)) {
+    s.halfPeriodUs = PULSE_MIN_US + 2;
+  }
+}
+
+// Release the motor after a move, honouring holdMode. Replaces every direct
+// stepperEnable(s, false) call. With holdMode true the motor stays energised so
+// load or gravity cannot turn it. This is also the diagnostic path: if "keeps
+// spinning" disappears with holdMode true, the cause is a free motor plus load,
+// not the signal.
 void stepperRelease(Stepper &s) {
-  if (holdMode) return;          // tetap dikunci, motor menahan posisi
+  if (holdMode) return;          // stay locked, motor holds position
   stepperEnable(s, false);
 }
 
-// ============================================================
-//  UJI DIR MANUAL  (untuk memisahkan dua penyebab "selalu searah")
-// ============================================================
+// Manual DIR test. Two causes of "always the same direction" look identical on
+// screen: the 5 V rail is dead (the buck dies when testing from a laptop), so
+// DIR+ has no voltage; or the DIR wire is wrong or loose, so DIR never arrives.
 //
-//  PROBLEM yang dipecahkan:
-//  Kalau lid selalu bergerak satu arah, ada dua kemungkinan yang
-//  gejalanya IDENTIK dari layar:
-//    (a) 5V untuk TB6600 MATI (mis. buck converter ikut mati saat
-//        diuji dari laptop)  -> DIR+ tidak punya tegangan
-//    (b) kabel DIR- salah/lepas  -> DIR tidak sampai ke driver
-//
-//  Cara memisahkan: kita gerakkan DIR dan PUL SECARA TERPISAH, lalu
-//  uji apakah motor bereaksi. Karena kita tidak punya sensor, yang
-//  diuji adalah URUTAN gerakannya:
-//
-//    UJI A: set DIR ke satu posisi, gerakkan sedikit, TANDai
-//    UJI B: set DIR ke posisi lain, gerakkan sedikit lagi
-//
-//  Kalau DIR bekerja, kedua gerakan itu berlawanan arah sehingga motor
-//  kembali ke posisi semula (kamu melihatnya goyang bolak-balik).
-//  Kalau DIR tidak bekerja, kedua gerakan itu searah sehingga motor
-//  berjalan terus ke satu arah.
-//
-//  Fungsi ini mengembalikan nilai-nilai yang bisa dibaca di /debug
-//  supaya bisa dibedakan tanpa alat ukur.
+// Since there is no sensor, the test drives DIR and PUL separately and checks the
+// order of motion: set DIR one way and move a little, then set DIR the other way
+// and move a little more. If DIR works the two moves oppose each other and the
+// motor returns to where it started, which you see as rocking. If DIR does not
+// work the moves go the same way and the motor walks off in one direction.
 
-// Gerakkan satu motor sejumlah step tertentu dengan arah paksa.
-// Dipakai HANYA oleh uji DIR. Blocking, jadi harus dari konteks aman.
+// Drive one motor by a given number of steps in a forced direction. Used only by
+// the DIR test. Blocking, so call it from a safe context.
 void stepperJog(Stepper &s, long steps, int forcedDir, float sps) {
   if (steps <= 0) return;
 
-  // Paksa arah tanpa mengubah target posisi permanen
+  // Force the direction without disturbing the permanent target
   long savedTarget = s.targetStep;
   long savedDir    = s.dir;
 
@@ -979,13 +807,14 @@ void stepperJog(Stepper &s, long steps, int forcedDir, float sps) {
   digitalWrite(s.pinDir, (forcedDir > 0) ? DIR_FOR_POS : DIR_FOR_NEG);
   delayMicroseconds(10);
 
+  // The initial period must be valid before the first tick.
+  stepperPrimePeriod(s, sps);
+
   s.lastPulseUs = micros();
   s.moving      = true;
 
-  // Reset pelacak pengukuran supaya angka yang dilaporkan hanya
-  // mencakup gerakan jog ini, bukan menumpuk dari gerakan sebelumnya.
-  // (sebelumnya stepperJog tidak melakukannya, sehingga laporan
-  // menampilkan jumlah pulsa yang jauh lebih besar dari seharusnya)
+  // Clear the measurement trackers so the reported numbers cover only this jog
+  // instead of accumulating from previous moves.
   gPeriodCount        = 0;
   gPeriodSumUs        = 0;
   gPeriodMaxUs        = 0;
@@ -994,90 +823,57 @@ void stepperJog(Stepper &s, long steps, int forcedDir, float sps) {
   gLonjakCount        = 0;
   gLonjakTerbesarUs   = 0;
 
-  // Tunggu sampai selesai, dengan batas waktu aman
+  // Wait for completion with a safe bound. The bound is 30 s, not 3 s: at
+  // microstep 1/8 a 90 degree test move (400 steps) at 100 steps/s takes 4.0 s,
+  // so the old 3 s limit cut the move short and under-reported pulses.
   unsigned long t0 = millis();
-  while (s.moving && (millis() - t0) < 3000UL) {
+  while (s.moving && (millis() - t0) < 30000UL) {
     stepperTick(s, micros());
   }
 
   s.moving = false;
   stepperRelease(s);
 
-  // Pulihkan target supaya posisi tidak melompat di pandangan pengguna
+  // Restore the target so the position does not jump in the UI
   s.targetStep = savedTarget;
   s.dir        = savedDir;
 }
 
 // ============================================================
-//  UJI TORSI DAN KECEPATAN MAKSIMAL  (SWEEP OTOMATIS)
+//  TORQUE AND MAX SPEED TEST  (AUTOMATIC SWEEP)
 // ============================================================
 //
-//  LATAR BELAKANG: KENAPA TORSI TIDAK BISA DIATUR DARI FIRMWARE
+// Stepper torque cannot be set from firmware. It comes from two hardware things:
 //
-//  Pertanyaan "apakah torsi stepper bisa diatur" jawabannya: BISA,
-//  tetapi BUKAN dari program ini. Torsi motor stepper ditentukan dua
-//  hal, dan keduanya perangkat keras:
+//  1. The current set on the TB6600 (SW1/SW2/SW3), usually 0.5-4.0 A. A NEMA 17
+//     wants 1.5-2.0 A. If the current is too low the motor loses steps or cannot
+//     lift the load, and no command from the ESP32 can add torque: PUL and DIR
+//     only decide when and which way the motor turns, not how hard.
 //
-//  1. ARUS YANG DISETEL DI TB6600 (paling menentukan).
-//     Arus ini diatur DIP switch SW1/SW2/SW3 di modul TB6600. Nilai
-//     yang tersedia biasanya 0.5 sampai 4.0 A. NEMA 17 umumnya butuh
-//     1.5 sampai 2.0 A. Selama arusnya terlalu kecil, motor akan
-//     kehilangan langkah atau tidak kuat mengangkat beban, DAN TIDAK
-//     ADA PERINTAH DARI ESP32 YANG BISA MENAMBAHNYA. Sinyal PUL dan
-//     DIR hanya menentukan kapan dan ke arah mana motor berputar,
-//     bukan seberapa kuat.
+//  2. The microstep level (SW4/SW5/SW6). Counter-intuitively, a higher microstep
+//     LOWERS torque per step. Per Faulhaber Application Note 015, torque per
+//     microstep as a fraction of holding torque:
+//        1 -> 100.00 %    2 -> 70.71 %    4 -> 38.27 %
+//        8 ->  19.51 %   16 ->  9.80 %
+//     At 16 a single step gives under 10 percent of holding torque, while the
+//     motor's own detent torque is 5-20 percent. So many microsteps cannot beat
+//     the detent torque at all and produce no motion. For a heavy load a LOW
+//     microstep gives more torque, and a lid needs no 3200 pulses/rev.
 //
-//  2. LEVEL MICROSTEP (DIP switch SW4/SW5/SW6).
-//     Ini berlawanan dengan intuisi, tetapi menaikkan microstep
-//     justru MENURUNKAN torsi per langkah. Menurut Faulhaber
-//     Application Note 015, torsi per microstep dibanding torsi
-//     holding penuh adalah:
+// If torque is short, in order: raise the TB6600 current (biggest and cheapest
+// win), drop the microstep, raise the motor supply to 24 V, lower the speed.
 //
-//        microstep  1 -> 100.00 persen
-//        microstep  2 ->  70.71 persen
-//        microstep  4 ->  38.27 persen
-//        microstep  8 ->  19.51 persen
-//        microstep 16 ->   9.80 persen
+// After changing microstepping, STEPS_PER_REV and DIP_TERAKHIR must both change,
+// or every commanded angle is wrong:
+//        4  ->  800.0 / 360.0 = 2.2222
+//        8  -> 1600.0 / 360.0 = 4.4444  (current)
+//       16  -> 3200.0 / 360.0 = 8.8889
 //
-//     Pada microstep 16, satu langkah hanya menghasilkan kurang dari
-//     10 persen torsi holding. Sementara itu detent torque motor
-//     sendiri 5 sampai 20 persen dari holding torque. Artinya torsi
-//     satu microstep seringkali TIDAK CUKUP untuk mengalahkan detent
-//     torque, sehingga sebagian perintah langkah tidak menghasilkan
-//     gerakan sama sekali.
-//
-//     Jadi untuk beban berat, microstep RENDAH memberi torsi lebih
-//     besar. Lid tong sampah tidak butuh resolusi 3200 pulsa per
-//     putaran, jadi menurunkan ke 8 atau 4 adalah pertukaran yang
-//     menguntungkan: resolusi yang tidak dipakai ditukar dengan
-//     torsi yang memang dibutuhkan.
-//
-//  KALAU TORSI KURANG, URUTAN YANG DISARANKAN:
-//     a. Naikkan arus TB6600 lewat SW1/SW2/SW3 ke 1.5 sampai 2.0 A.
-//        Ini perbaikan terbesar dan paling murah.
-//     b. Turunkan microstep dari 16 ke 8.
-//     c. Naikkan tegangan suplai motor ke 24 V kalau memungkinkan.
-//     d. Turunkan kecepatan gerak.
-//
-//  SETELAH MENGUBAH MICROSTEP, `STEPS_PER_DEG` DI FIRMWARE WAJIB
-//  IKUT DIUBAH. Kalau tidak, sudut yang diminta akan salah:
-//        microstep  4 -> 3600.0 / 360.0 = 10.0000
-//        microstep  8 -> 1600.0 / 360.0 =  4.4444
-//        microstep 16 -> 3200.0 / 360.0 =  8.8889  (nilai sekarang)
-//
-//  ------------------------------------------------------------
-//  ALAT UJI INI
-//  ------------------------------------------------------------
-//
-//  Karena torsi tidak bisa diubah dari firmware, yang bisa dilakukan
-//  adalah MENGUKUR pada kecepatan berapa motor mulai kehilangan
-//  langkah. Dari situ ketahuan batas aman, dan ketahuan juga apakah
-//  masalahnya di kecepatan atau memang di arus.
-//
-//  Uji ini menjalankan gerakan bolak-balik pada kecepatan yang naik
-//  bertahap, lalu melaporkan pada tahap berapa mulai meleset.
+// Since firmware cannot change torque, this test MEASURES the speed at which the
+// motor starts losing steps. That gives the safe limit and shows whether the
+// problem is speed or current.
 
-// Hasil satu tahap uji
+// Result of one test stage
 struct HasilSweep {
   float    sps;
   uint32_t minta;
@@ -1093,14 +889,12 @@ HasilSweep sweepHasil[SWEEP_MAKS_TAHAP];
 uint8_t    sweepJumlahTahap = 0;
 uint16_t   sweepTotalMeleset = 0;
 
-// Kecepatan tertinggi yang masih tepat, dikali 10 supaya bisa
-// dikirim sebagai bilangan bulat. -10 berarti belum ada yang aman.
+// Highest speed that was still exact. -1.0 means nothing was safe yet.
 float sweepKecepatanAman = -1.0f;
 
-// Jalankan satu gerakan uji pada satu kecepatan, lalu hitung
-// selisih antara langkah yang diminta dan yang benar-benar keluar.
+// Run one test move at one speed, then compare requested and emitted steps.
 void sweepSatuTahap(Stepper &s, float sps, long langkah) {
-  // Siapkan gerakan
+  // Set up the move
   s.dir          = +1;
   s.targetStep   = s.currentStep + langkah;
   s.speedTarget  = sps;
@@ -1113,7 +907,7 @@ void sweepSatuTahap(Stepper &s, float sps, long langkah) {
   digitalWrite(s.pinPul, PULSE_OFF);
   delayMicroseconds(20);
 
-  // Nolkan pelacak supaya angka yang dilaporkan hanya untuk tahap ini
+  // Clear the trackers so the numbers cover this stage only
   gPeriodCount      = 0;
   gPeriodSumUs      = 0;
   gPeriodMaxUs      = 0;
@@ -1124,11 +918,14 @@ void sweepSatuTahap(Stepper &s, float sps, long langkah) {
 
   uint32_t awal = stepTotal;
 
+  // The initial period must be valid before the first tick.
+  stepperPrimePeriod(s, sps);
+
   s.lastPulseUs = micros();
   s.moving      = true;
 
-  // Jalankan sampai selesai. Batas 5 detik mencegah robot menggantung
-  // kalau ada yang tidak beres.
+  // Run to completion; the 5 s bound keeps the robot from hanging if something
+  // is wrong.
   unsigned long t0 = millis();
   while (s.moving && (millis() - t0) < 5000UL) {
     stepperTick(s, micros());
@@ -1137,7 +934,7 @@ void sweepSatuTahap(Stepper &s, float sps, long langkah) {
   s.moving = false;
   stepperRelease(s);
 
-  // Catat hasilnya
+  // Record the result
   HasilSweep &h = sweepHasil[sweepJumlahTahap];
   h.sps        = sps;
   h.minta      = (uint32_t)langkah;
@@ -1158,7 +955,7 @@ void sweepSatuTahap(Stepper &s, float sps, long langkah) {
 
   sweepJumlahTahap++;
 
-  // Kembalikan ke posisi semula supaya lid tidak makin terbuka terus
+  // Return to the starting position so the lid does not keep opening
   s.targetStep = s.currentStep - langkah;
   s.dir        = -1;
   s.speedTarget  = sps;
@@ -1182,23 +979,22 @@ void sweepSatuTahap(Stepper &s, float sps, long langkah) {
   s.moving = false;
   stepperRelease(s);
 
-  // Jeda antar tahap supaya motor dan driver tidak kepanasan.
+  // Pause between stages so motor and driver do not overheat.
   delay(300);
 }
 
-// Uji seluruh rentang kecepatan pada satu lid, dari lambat ke cepat.
-// Berhenti lebih awal kalau dua tahap berturut-turut sudah meleset,
-// supaya motor tidak dipaksa terus saat sudah jelas tidak kuat.
+// Sweep the whole speed range on one lid, slow to fast. Stops early after two
+// consecutive misses, so the motor is not driven on once it is clearly unable.
 void sweepKecepatan(Stepper &s, const char* nama) {
-  // Kecepatan uji, dari paling lambat ke paling cepat
   const float daftar[] = { 200, 400, 600, 800, 1000,
                            1200, 1400, 1600, 1800, 2000 };
   const uint8_t jumlah = sizeof(daftar) / sizeof(daftar[0]);
 
-  // Panjang gerakan 800 langkah = 90 derajat. Cukup panjang supaya
-  // motor benar-benar mencapai kecepatan penuh, dan cukup pendek
-  // supaya banyak tahap bisa diuji tanpa lid membentur apa pun.
-  const long LANGKAH = 800;
+  // 800 steps, written as 180 degrees times STEPS_PER_DEG so it follows a
+  // microstep change: 800 steps at 1/8 (180 degrees), 1600 at 1/16. Long enough
+  // to reach full speed, short enough to run many stages without hitting
+  // anything.
+  const long LANGKAH = (long)lroundf(180.0f * STEPS_PER_DEG);
 
   sweepJumlahTahap  = 0;
   sweepTotalMeleset = 0;
@@ -1206,8 +1002,8 @@ void sweepKecepatan(Stepper &s, const char* nama) {
   float speedSebelumnya = stepSpeedActive;
 
   addLogf("[SWEEP] ===== MULAI ===== lid %s", nama);
-  addLogf("[SWEEP] %u tahap, %ld langkah tiap tahap (90 derajat)",
-          (unsigned)jumlah, LANGKAH);
+  addLogf("[SWEEP] %u tahap, %ld langkah tiap tahap (%.0f derajat)",
+          (unsigned)jumlah, LANGKAH, (float)LANGKAH / STEPS_PER_DEG);
 
   uint8_t gagalBerturut = 0;
 
@@ -1220,7 +1016,7 @@ void sweepKecepatan(Stepper &s, const char* nama) {
       gagalBerturut = 0;
     }
 
-    // Dua tahap meleset berturut-turut = sudah lewat batasnya.
+    // Two misses in a row means the limit is passed.
     if (gagalBerturut >= 2) {
       addLogf("[SWEEP] Dua tahap meleset berturut-turut, uji dihentikan di %.0f step/s",
               daftar[i]);
@@ -1228,7 +1024,7 @@ void sweepKecepatan(Stepper &s, const char* nama) {
     }
   }
 
-  // Cari kecepatan tertinggi yang masih tepat
+  // Find the highest speed that was still exact
   float aman = -1.0f;
   for (uint8_t i = 0; i < sweepJumlahTahap; i++) {
     if (!sweepHasil[i].meleset) aman = sweepHasil[i].sps;
@@ -1250,24 +1046,458 @@ void sweepKecepatan(Stepper &s, const char* nama) {
   addLogf("[SWEEP] Tahap diuji: %u, tahap meleset: %u",
           sweepJumlahTahap, sweepTotalMeleset);
 
-  // Kembalikan kecepatan semula
+  // Restore the previous speed
   stepSpeedActive = speedSebelumnya;
 }
 
-// Jalankan uji DIR: gerakkan maju sedikit, lalu mundur sedikit.
-// Kalau DIR bekerja, motor akan bergoyang bolak-balik di tempat.
-// Kalau tidak, motor akan jalan terus satu arah.
-void stepperDirTest(Stepper &s, const char* nama) {
-  // 400 step = 45 derajat, cukup terlihat & terdengar, dan cukup panjang
-  // supaya motor benar-benar mencapai kecepatan penuh di tengah gerakan.
-  // JOG 200 step terlalu pendek: ramp (min 150 step) memakan hampir
-  // seluruh gerakan sehingga motor hanya mencapai ~60% kecepatan.
-  long JOG = 400;
-  float sps = 300.0;       // pelan supaya jelas terlihat
+// Pin signal test, separating firmware faults from wiring faults. If the stepper
+// does not move at all, either the ESP32 emits no pulses (firmware) or it emits
+// them and the motor stays still (wiring or power). This test counts the pulses
+// actually emitted on the PUL pin, so a correct count proves the ESP32 did its
+// job and the fault is outside it. Read it two ways: the log count, or watch the
+// PUL pin with an LED or meter while the test runs.
+void ujiSinyalPin(Stepper &s, const char* nama, uint32_t jumlah, float sps) {
+  addLogf("[UJIPIN] %s: kirim %lu pulsa @ %.0f step/s",
+          nama, (unsigned long)jumlah, sps);
 
-  // Ingat kecepatan yang sedang berlaku, lalu PAKSA kecepatan uji.
-  // stepperJog memakai sps sendiri, tapi variabel aktualnya perlu
-  // di-set supaya laporan rasio menghitung terhadap angka yang benar.
+  // Set up the move like a normal one
+  s.dir          = +1;
+  s.targetStep   = s.currentStep + (long)jumlah;
+  s.speedTarget  = sps;
+  s.speedCurrent = 0;
+  s.pulseHigh    = false;
+  s.warmUp       = 2;
+
+  stepperEnable(s, true);
+  digitalWrite(s.pinDir, DIR_FOR_POS);
+  digitalWrite(s.pinPul, PULSE_OFF);
+  delayMicroseconds(20);
+
+  uint32_t awal = stepTotal;
+
+
+  stepperPrimePeriod(s, sps);   // valid initial period (see function)
+
+  s.lastPulseUs = micros();
+  s.moving      = true;
+
+  unsigned long t0 = millis();
+  while (s.moving && (millis() - t0) < 5000UL) {
+    stepperTick(s, micros());
+  }
+  s.moving = false;
+  stepperRelease(s);
+
+  uint32_t keluar = stepTotal - awal;
+
+  addLogf("[UJIPIN] %s: pulsa keluar %lu dari %lu diminta",
+          nama, (unsigned long)keluar, (unsigned long)jumlah);
+
+  if (keluar == jumlah) {
+    addLog("[UJIPIN] ESP32 SUDAH BENAR mengirim pulsa.");
+    addLog("[UJIPIN] Kalau motor tetap diam, masalahnya DI LUAR ESP32:");
+    addLog("[UJIPIN] cek 5V ke PUL+/DIR+/ENA+, kabel PUL, dan DIP switch.");
+  } else {
+    addLogf("[UJIPIN] JUMLAH PULSA TIDAK COCOK - selisih %ld",
+            (long)keluar - (long)jumlah);
+  }
+
+  // Return to original position so the lid does not drift permanently
+  s.targetStep = s.currentStep - (long)jumlah;
+  s.dir        = -1;
+  s.speedTarget  = sps;
+  s.speedCurrent = 0;
+  s.pulseHigh    = false;
+  s.warmUp       = 2;
+
+  stepperEnable(s, true);
+  digitalWrite(s.pinDir, DIR_FOR_NEG);
+  digitalWrite(s.pinPul, PULSE_OFF);
+  delayMicroseconds(20);
+
+  stepperPrimePeriod(s, sps);   // valid initial period
+
+  s.lastPulseUs = micros();
+  s.moving      = true;
+  t0 = millis();
+  while (s.moving && (millis() - t0) < 5000UL) {
+    stepperTick(s, micros());
+  }
+  s.moving = false;
+  stepperRelease(s);
+}
+
+// ============================================================
+//  ENA POLARITY TEST  (tells common-anode from common-cathode)
+// ============================================================
+//
+//  Symptom: stepper is STIFF at rest (cannot be turned by hand) but does
+//  NOT move and is SILENT when commanded, while the firmware log reports
+//  a full pulse count (e.g. 200 of 200).
+//
+//  That points to inverted ENA polarity: TB6600 releases the motor exactly
+//  when told to move and locks it when it should be idle.
+//
+//  Cause: firmware assumes common-anode 5V wiring (ENA+ to 5V, ENA- to
+//  GPIO, so active LOW). With common-cathode wiring (ENA+ to GPIO, ENA-
+//  to GND) it is active HIGH and the logic is inverted.
+//
+//  This test drives the motor with TWO different polarities. Just watch on
+//  which attempt the motor actually turns.
+//
+//  Usage: send 'P' and watch the motor.
+//    P   -> test LEFT lid
+//    PR  -> test RIGHT lid
+void ujiPolaritasEna(Stepper &s, const char* nama) {
+  const uint32_t JML = 400;
+  const float    SPS = 200.0f;
+
+  addLogf("[UJIENA] %s: mulai. Perhatikan percobaan mana yang BERPUTAR.", nama);
+  addLog("[UJIENA] Percobaan 1 dari 2: level ENA seperti setelan sekarang.");
+  delay(1000);
+
+  // ---------- Attempt 1: current polarity ----------
+  {
+    s.dir          = +1;
+    s.targetStep   = s.currentStep + (long)JML;
+    s.speedTarget  = SPS;
+    s.speedCurrent = 0;
+    s.pulseHigh    = false;
+    s.warmUp       = 2;
+
+    stepperEnable(s, true);
+    digitalWrite(s.pinDir, DIR_FOR_POS);
+    digitalWrite(s.pinPul, PULSE_OFF);
+    delayMicroseconds(20);
+
+    stepperPrimePeriod(s, SPS);   // valid initial period
+
+    s.lastPulseUs = micros();
+    s.moving      = true;
+    unsigned long t0 = millis();
+    while (s.moving && (millis() - t0) < 5000UL) {
+      stepperTick(s, micros());
+    }
+    s.moving = false;
+
+    addLogf("[UJIENA] Percobaan 1 selesai. ENA dipaksa %s.",
+            (ENA_ACTIVE == LOW) ? "LOW" : "HIGH");
+  }
+
+  stepperRelease(s);
+  delay(1500);
+
+  // ---------- Attempt 2: inverted polarity ----------
+  addLog("[UJIENA] Percobaan 2 dari 2: level ENA DIBALIK. Perhatikan lagi.");
+  delay(1000);
+
+  {
+    // Force the ENA level opposite to the firmware setting
+    digitalWrite(s.pinEna, ENA_INACTIVE);
+    s.enabled = true;   // keep stepperEnable from overriding it
+
+    s.dir          = +1;
+    s.targetStep   = s.currentStep + (long)JML;
+    s.speedTarget  = SPS;
+    s.speedCurrent = 0;
+    s.pulseHigh    = false;
+    s.warmUp       = 2;
+
+    digitalWrite(s.pinDir, DIR_FOR_POS);
+    digitalWrite(s.pinPul, PULSE_OFF);
+    delayMicroseconds(20);
+
+    stepperPrimePeriod(s, SPS);   // valid initial period
+
+    s.lastPulseUs = micros();
+    s.moving      = true;
+    unsigned long t0 = millis();
+    while (s.moving && (millis() - t0) < 5000UL) {
+      stepperTick(s, micros());
+    }
+    s.moving = false;
+
+    addLogf("[UJIENA] Percobaan 2 selesai. ENA dipaksa %s.",
+            (ENA_INACTIVE == LOW) ? "LOW" : "HIGH");
+
+    // Back to normal polarity, and let the motor really release
+    digitalWrite(s.pinEna, ENA_INACTIVE);
+    s.enabled = false;
+  }
+
+  // Return to the starting position so the lid does not drift permanently
+  s.targetStep = s.currentStep - (long)JML;
+  s.dir        = -1;
+  s.speedTarget  = SPS;
+  s.speedCurrent = 0;
+  s.pulseHigh    = false;
+  s.warmUp       = 2;
+
+  stepperEnable(s, true);
+  digitalWrite(s.pinDir, DIR_FOR_NEG);
+  digitalWrite(s.pinPul, PULSE_OFF);
+  delayMicroseconds(20);
+
+  stepperPrimePeriod(s, SPS);   // valid initial period
+
+  s.lastPulseUs = micros();
+  s.moving      = true;
+  unsigned long t0 = millis();
+  while (s.moving && (millis() - t0) < 5000UL) {
+    stepperTick(s, micros());
+  }
+  s.moving = false;
+  stepperRelease(s);
+
+  addLog("[UJIENA] Selesai.");
+  addLog("[UJIENA] Kalau motor BERPUTAR di percobaan 1 saja:");
+  addLog("[UJIENA]   polaritas ENA sudah BENAR, masalahnya di tempat lain.");
+  addLog("[UJIENA] Kalau motor BERPUTAR di percobaan 2 saja:");
+  addLog("[UJIENA]   polaritas ENA TERBALIK. Wiring kamu common-cathode.");
+  addLog("[UJIENA] Kalau DIAM di kedua percobaan:");
+  addLog("[UJIENA]   sinyal PUL atau DIR tidak sampai ke TB6600.");
+}
+
+// ============================================================
+//  FORCE RELEASE HOLD MODE  (diagnoses a stiff motor)
+// ============================================================
+//
+//  A stiff motor that cannot be turned by hand at rest has two possible
+//  causes: holdMode active (firmware holding it on purpose, normal, cleared
+//  with H0), or inverted ENA polarity (driver locks the motor when it
+//  should be free -- fix the wiring). If it is still stiff after H0, it is
+//  the polarity.
+void ujiLepasMotor(Stepper &s, const char* nama) {
+  addLogf("[LEPAS] %s: paksa ENA ke level BEBAS.", nama);
+
+  bool sebelum = holdMode;
+  holdMode = false;
+
+  digitalWrite(s.pinEna, ENA_INACTIVE);
+  s.enabled = false;
+
+  addLogf("[LEPAS] %s: ENA sekarang %s (level %d).",
+          nama,
+          (s.enabled ? "AKTIF" : "BEBAS"),
+          s.pinEna);
+
+  addLog("[LEPAS] Coba putar batang motor dengan tangan sekarang.");
+  addLog("[LEPAS] Kalau MASIH kaku, polaritas ENA terbalik.");
+  addLog("[LEPAS] Kalau sudah bisa diputar, motor sudah lepas dengan benar.");
+
+  holdMode = sebelum;
+}
+
+// ============================================================
+//  PHYSICAL PIN TEST  (reads the pin level, not just writes it)
+// ============================================================
+//
+//  Earlier tools only WROTE to the pin and reported "200 of 200 pulses
+//  out". That only proves stepperTick ran, not that the chip pin actually
+//  changed level. If a pin is held (cable loading it, damaged pin, conflict
+//  with another ESP32 function) the firmware still reports success while
+//  the pin never moves -- exactly our symptom: always success, no motor
+//  motion, and no change in sound even with wider pulses.
+//
+//  This test writes the pin then READS IT BACK with digitalRead and
+//  compares. A mismatch means the pin cannot be driven freely, which is
+//  the real cause.
+//
+//  NOTE ON VALIDITY: with the TB6600 still connected, its input circuit can
+//  pull the pin level, which is exactly what makes this test useful --
+//  a pin that will not change level when written shows a load is holding it.
+void ujiPinFisik(Stepper &s, const char* nama) {
+  addLogf("[UJIPIN2] ===== %s =====", nama);
+  addLogf("[UJIPIN2] PUL=GPIO%d  DIR=GPIO%d  ENA=GPIO%d",
+          (int)s.pinPul, (int)s.pinDir, (int)s.pinEna);
+
+  // ---------- Test 1: can pin PUL be toggled? ----------
+  addLog("[UJIPIN2] Tes PUL: tulis HIGH lalu baca, tulis LOW lalu baca.");
+
+  pinMode(s.pinPul, OUTPUT);
+  delayMicroseconds(50);
+
+  int gagalPul = 0;
+
+  for (int i = 0; i < 8; i++) {
+    digitalWrite(s.pinPul, HIGH);
+    delayMicroseconds(30);
+    int bacaHigh = digitalRead(s.pinPul);
+
+    digitalWrite(s.pinPul, LOW);
+    delayMicroseconds(30);
+    int bacaLow = digitalRead(s.pinPul);
+
+    if (bacaHigh != HIGH) gagalPul++;
+    if (bacaLow  != LOW)  gagalPul++;
+
+    addLogf("[UJIPIN2] PUL putaran %d: tulis HIGH baca %s, tulis LOW baca %s",
+            i + 1,
+            (bacaHigh == HIGH ? "HIGH" : "LOW"),
+            (bacaLow  == LOW  ? "LOW"  : "HIGH"));
+  }
+
+  digitalWrite(s.pinPul, PULSE_IDLE);
+
+  if (gagalPul == 0) {
+    addLog("[UJIPIN2] PUL OK - pin bisa dibolak-balik dengan benar.");
+  } else {
+    addLogf("[UJIPIN2] PUL BERMASALAH - %d dari 16 pembacaan tidak cocok.", gagalPul);
+    addLog("[UJIPIN2] Pin PUL tidak bisa dikendalikan bebas. Cek kabel ke TB6600.");
+  }
+
+  // ---------- Test 2: can pin DIR be toggled? ----------
+  addLog("[UJIPIN2] Tes DIR: tulis LOW lalu baca, tulis HIGH lalu baca.");
+
+  pinMode(s.pinDir, OUTPUT);
+  delayMicroseconds(50);
+
+  int gagalDir = 0;
+
+  for (int i = 0; i < 8; i++) {
+    digitalWrite(s.pinDir, LOW);
+    delayMicroseconds(30);
+    int bacaLow = digitalRead(s.pinDir);
+
+    digitalWrite(s.pinDir, HIGH);
+    delayMicroseconds(30);
+    int bacaHigh = digitalRead(s.pinDir);
+
+    if (bacaLow  != LOW)  gagalDir++;
+    if (bacaHigh != HIGH) gagalDir++;
+
+    addLogf("[UJIPIN2] DIR putaran %d: tulis LOW baca %s, tulis HIGH baca %s",
+            i + 1,
+            (bacaLow  == LOW  ? "LOW"  : "HIGH"),
+            (bacaHigh == HIGH ? "HIGH" : "LOW"));
+  }
+
+  digitalWrite(s.pinDir, DIR_FOR_POS);
+
+  if (gagalDir == 0) {
+    addLog("[UJIPIN2] DIR OK - pin bisa dibolak-balik dengan benar.");
+  } else {
+    addLogf("[UJIPIN2] DIR BERMASALAH - %d dari 16 pembacaan tidak cocok.", gagalDir);
+  }
+
+  // ---------- Test 3: can pin ENA be toggled? ----------
+  addLog("[UJIPIN2] Tes ENA: tulis LOW lalu baca, tulis HIGH lalu baca.");
+
+  pinMode(s.pinEna, OUTPUT);
+  delayMicroseconds(50);
+
+  int gagalEna = 0;
+
+  for (int i = 0; i < 8; i++) {
+    digitalWrite(s.pinEna, LOW);
+    delayMicroseconds(30);
+    int bacaLow = digitalRead(s.pinEna);
+
+    digitalWrite(s.pinEna, HIGH);
+    delayMicroseconds(30);
+    int bacaHigh = digitalRead(s.pinEna);
+
+    if (bacaLow  != LOW)  gagalEna++;
+    if (bacaHigh != HIGH) gagalEna++;
+
+    addLogf("[UJIPIN2] ENA putaran %d: tulis LOW baca %s, tulis HIGH baca %s",
+            i + 1,
+            (bacaLow  == LOW  ? "LOW"  : "HIGH"),
+            (bacaHigh == HIGH ? "HIGH" : "LOW"));
+  }
+
+  digitalWrite(s.pinEna, ENA_INACTIVE);
+  s.enabled = false;
+
+  if (gagalEna == 0) {
+    addLog("[UJIPIN2] ENA OK - pin bisa dibolak-balik dengan benar.");
+  } else {
+    addLogf("[UJIPIN2] ENA BERMASALAH - %d dari 16 pembacaan tidak cocok.", gagalEna);
+  }
+
+  // ---------- Conclusion ----------
+  addLog("[UJIPIN2] ----- Kesimpulan -----");
+
+  if (gagalPul == 0 && gagalDir == 0 && gagalEna == 0) {
+    addLog("[UJIPIN2] Ketiga pin ESP32 SEHAT dan bisa dikendalikan.");
+    addLog("[UJIPIN2] Jadi masalahnya pasti SETELAH ESP32:");
+    addLog("[UJIPIN2] kabel, TB6600, arus, atau suplai motor.");
+  } else {
+    addLog("[UJIPIN2] ADA PIN YANG TIDAK BISA DIKENDALIKAN.");
+    addLog("[UJIPIN2] Ini penyebab motor tidak bergerak walau log");
+    addLog("[UJIPIN2] firmware selalu melaporkan pulsa keluar lengkap.");
+    addLog("[UJIPIN2] Coba lepas kabel pin bermasalah dari TB6600,");
+    addLog("[UJIPIN2] lalu jalankan uji ini lagi. Kalau jadi OK,");
+    addLog("[UJIPIN2] berarti rangkaian input TB6600 yang menahan pin.");
+  }
+}
+
+// ============================================================
+//  MULTIMETER MODE  (diagnoses "hums but does not move")
+// ============================================================
+//
+//  Symptom: motor only HUMS faintly (audible with an ear against it) but
+//  does not budge, while every firmware test passes: healthy pins (J),
+//  full pulse count (E), both ENA polarities tried (U).
+//
+//  HUMMING = the TB6600 is applying holding current, which proves the
+//  MOTOR supply and driver are alive. What is missing is the RESPONSE TO
+//  PULSES, i.e. the PUL optocoupler never sees a current transition.
+//
+//  In common-anode wiring the optocoupler current must COMPLETE THE LOOP:
+//      5V -> PUL+ -> optocoupler LED -> PUL- -> GPIO -> ESP32 GND
+//                              -> buck GND -> back to 5V
+//
+//  If buck GND and ESP32 GND are NOT connected the loop is broken: the
+//  motor keeps humming (holding current takes another path) but the pulses
+//  never arrive. This is the most common cause of this symptom.
+//
+//  USAGE:
+//    Send 'M' -> pin PUL HELD at IDLE level
+//    Send 'N' -> pin PUL HELD at ACTIVE level
+//  Then measure with a multimeter (DC volts):
+//    1. PUL+ to PUL-             -> must show a voltage difference
+//    2. ESP32 GND to buck GND    -> MUST be 0V (connected)
+//    3. PUL- to ESP32 GND        -> must change between M and N
+//
+//  If ESP32 GND to buck GND is not 0V (or unreadable), tie the two module
+//  grounds together. That is the fix for this humming symptom.
+void ujiTahanPul(Stepper &s, const char* nama, bool aktif) {
+  s.moving = false;              // make sure no move is in progress
+
+  pinMode(s.pinPul, OUTPUT);
+  digitalWrite(s.pinPul, aktif ? PULSE_ON : PULSE_OFF);
+
+  int level = digitalRead(s.pinPul);
+
+  addLogf("[UKUR] %s: pin PUL (GPIO%d) DITAHAN di level %s.",
+          nama, (int)s.pinPul, aktif ? "AKTIF" : "IDLE");
+  addLogf("[UKUR] Level terukur di pin: %s (%d)",
+          (level == HIGH ? "HIGH" : "LOW"), level);
+
+  addLog("[UKUR] Ukur dengan multimeter mode tegangan DC:");
+  addLogf("[UKUR]  1) PUL+ ke PUL-         : harus ada beda tegangan");
+  addLogf("[UKUR]  2) GND ESP32 ke GND buck: HARUS 0 V (tersambung)");
+  addLog("[UKUR]  3) GND buck ke GND ESP32: harus nyambung, bukan putus");
+  addLog("[UKUR] Kalau nomor 2 TIDAK 0 V -> GND belum tersambung.");
+  addLog("[UKUR] Kalau GND putus, motor mendesis tapi tidak bergerak.");
+  addLog("[UKUR] Sambungkan GND buck ke GND ESP32, lalu uji ulang.");
+}
+
+// DIR test: move forward a little, then back a little.
+// If DIR works the motor rocks back and forth in place;
+// otherwise it keeps running in one direction.
+void stepperDirTest(Stepper &s, const char* nama) {
+  // 400 step = 90 degrees at 1/8 microstep (45 at 1/16): visible and
+  // audible, and long enough for the motor to reach full speed mid-move.
+  // 200 is too short: the ramp (min 100 steps) eats nearly the whole move,
+  // so the motor only reaches ~60% speed.
+  long JOG = 400;
+  float sps = 300.0;       // slow so it is clearly visible
+
+  // Remember the active speed, then FORCE the test speed. stepperJog uses
+  // its own sps, but the actual variable must be set so the ratio report
+  // compares against the right number.
   float speedSebelumnya = stepSpeedActive;
   stepSpeedActive = sps;
 
@@ -1276,11 +1506,11 @@ void stepperDirTest(Stepper &s, const char* nama) {
   addLogf("[UJIDIR] %s: mulai uji (jog %ld step, 2 arah @ %.0f step/s)",
           nama, JOG, sps);
 
-  // Gerakan 1: arah positif
+  // Move 1: positive direction
   stepperJog(s, JOG, +1, sps);
   long posSetelahMaju = s.currentStep;
 
-  // Gerakan 2: arah negatif, kembali ke posisi awal
+  // Move 2: negative direction, back to the start position
   stepperJog(s, JOG, -1, sps);
   long posSetelahMundur = s.currentStep;
 
@@ -1289,8 +1519,8 @@ void stepperDirTest(Stepper &s, const char* nama) {
 
   addLogf("[UJIDIR] %s: gerakan1=%+ld, gerakan2=%+ld step", nama, maju, mundur);
 
-  // Laporkan kecepatan jog AKTUAL, bukan stepSpeedActive (yang bisa
-  // jauh berbeda karena uji DIR memakai kecepatan sendiri).
+  // Report the ACTUAL jog speed, not stepSpeedActive (which can differ
+  // widely because the DIR test uses its own speed).
   if (gPeriodCount > 0) {
     unsigned long pAvg = gPeriodSumUs / gPeriodCount;
     addLogf("[UJIDIR] %s: %lu pulsa, selisih jadwal rata2=%lu us (max %ld)",
@@ -1302,13 +1532,13 @@ void stepperDirTest(Stepper &s, const char* nama) {
             ? "firmware benar (maju lalu mundur)"
             : "firmware TIDAK membalik arah - BUG!");
 
-  // Kembalikan posisi tercatat ke posisi awal supaya kalibrasi tetap sah
+  // Restore the recorded position so calibration stays valid
   s.currentStep = posAwal;
   s.targetStep  = posAwal;
   s.moving      = false;
   stepperRelease(s);
 
-  // Pulihkan kecepatan yang berlaku sebelum uji
+  // Restore the speed that was active before the test
   stepSpeedActive = speedSebelumnya;
   addLogf("[UJIDIR] %s: kecepatan dikembalikan ke %.0f step/s",
           nama, speedSebelumnya);
@@ -1322,6 +1552,7 @@ void stepperDirTest(Stepper &s, const char* nama) {
 void stepperMoveToDeg(Stepper &s, float deg, float speedSps) {  if (speedSps < 50.0) speedSps = 50.0;
 
   s.targetStep   = lroundf(deg * STEPS_PER_DEG);
+
   long delta     = s.targetStep - s.currentStep;
 
   if (delta == 0) {
@@ -1329,116 +1560,110 @@ void stepperMoveToDeg(Stepper &s, float deg, float speedSps) {  if (speedSps < 5
     return;
   }
 
-  // ARAH OTOMATIS: arah SELALU ditentukan oleh selisih posisi.
-  //   delta positif (menambah sudut) = BUKA
-  //   delta negatif (mengurangi sudut) = TUTUP
-  // Jadi buka dan tutup PASTI berlawanan arah, dan lid selalu kembali
-  // lewat jalur yang sama. Tidak ada cara memaksa arah dari UI, supaya
-  // tidak mungkin terjadi gerakan yang menjauh dari target.
+  // AUTO DIRECTION: always derived from the position difference, so open and
+  // close are guaranteed opposite and the lid returns along the same path.
+  // The UI cannot force a direction, so motion away from the target is
+  // impossible.
   s.dir          = (delta >= 0) ? +1 : -1;
 
-  // ---- Catat jumlah langkah yang DIMINTA, untuk uji presisi ----
-  // Nanti setelah gerakan selesai, angka ini dibandingkan dengan jumlah
-  // pulsa yang benar-benar terkirim. Kalau sama, gerakan presisi.
+  // ---- Record the REQUESTED step count for the precision test ----
+  // Compared after the move against the pulses actually emitted.
   gMoveReqSteps = (uint32_t)(delta < 0 ? -delta : delta);
 
-  // Catat arah yang benar-benar diperintahkan. Dipakai halaman /debug
-  // untuk membuktikan DIR bekerja (pernah naik DAN turun).
+  // Record the direction actually commanded; the /debug page uses it to
+  // prove DIR works (went both up AND down).
   if (s.dir > 0) gMovedUp   = true;
   else           gMovedDown = true;
 
   s.speedTarget  = speedSps;
-  s.speedCurrent = 0;             // mulai dari diam, lalu di-ramp naik
+  s.speedCurrent = 0;             // start at rest, then ramp up
   s.pulseHigh    = false;
   s.pulseWidthUs = 0;
   s.warmUp       = 0;
+
+  // ---- FIX: COMPUTE halfPeriodUs HERE *** KEY *** ----
+  //  Bug: halfPeriodUs was not computed at move start, so it still held the
+  //  struct init value 0. The first pulse then fired immediately (elapsed
+  //  0 >= 0) and the next halfPeriodUs came from a speedCurrent just ramping
+  //  from zero -- ~accelPerStep (e.g. 2 step/s) -> 500000/2 = 250000us =
+  //  0.25s PER PULSE. The motor emitted a few pulses then looked dead, and
+  //  an 800-step move took so long the core-1 guard (>3M iterations) killed
+  //  it. Fixed by priming the initial period via stepperPrimePeriod().
+  stepperPrimePeriod(s, speedSps);
+
   s.lastPulseUs  = micros();
-  // Lewati 2 pulsa pertama saat mengukur jitter: perioda pulsa awal
-  // belum stabil karena speedCurrent baru di-ramp dari nol.
+  // Skip the first 2 pulses when measuring jitter: they are still ramping up
+  // from zero so their periods are unrepresentative.
   s.warmUp       = 2;
 
   stepperEnable(s, true);
-  // Arah mengikuti polaritas wiring (common-anode membalik logika DIR).
+  // Direction follows the wiring polarity (common-anode inverts DIR logic).
   uint8_t dirLevel = (s.dir > 0) ? DIR_FOR_POS : DIR_FOR_NEG;
   digitalWrite(s.pinDir, dirLevel);
 
-  // Catat arah yang DIPERINTAHKAN ke log. Ini penting untuk mendiagnosa
-  // masalah "buka dan tutup berputar ke arah yang sama": kalau log
-  // menunjukkan dir berubah (+1 lalu -1) tetapi motor secara fisik
-  // selalu berputar ke arah yang sama, berarti sinyal DIR tidak sampai
-  // ke TB6600 (masalah wiring pada pin DIR).
+  // Log the COMMANDED direction: if the log shows dir flipping but the motor
+  // always turns the same way, the DIR signal is not reaching the TB6600.
   addLogf("[DIR] %s: %ld -> %ld step (dir=%+ld, GPIO%d=%s)",
           (s.dir > 0 ? "BUKA" : "TUTUP"),
           s.currentStep, s.targetStep, s.dir,
           (int)s.pinDir,
           (dirLevel == HIGH ? "HIGH" : "LOW"));
 
-  // Penting untuk presisi: pastikan pin PUL dalam keadaan IDLE sebelum
-  // mengubah DIR. Kalau gerakan sebelumnya meninggalkan PUL di level
-  // aktif, mengubah DIR sekarang akan membuat driver membaca tepi palsu.
+  // Precision: force PUL to IDLE before changing DIR. If the previous move
+  // left PUL active, changing DIR now makes the driver see a false edge.
   digitalWrite(s.pinPul, PULSE_OFF);
   s.pulseHigh = false;
 
-  // DIR harus stabil jauh sebelum tepi pulsa pertama. TB6600 (seperti
-  // driver step/dir pada umumnya) mensyaratkan waktu setup DIR; 20 us
-  // jauh di atas kebutuhan dan tidak terasa pada kecepatan berapa pun.
+  // DIR must be stable well before the first pulse edge: the TB6600 needs a
+  // DIR setup time, and 20us is far above that at any speed.
   delayMicroseconds(20);
   s.moving = true;
 
-  // Tandai di RTC memory bahwa gerakan sedang berlangsung. Kalau ESP32
-  // reset sebelum gerakan selesai (mis. brownout karena noise motor),
-  // penanda ini masih ada saat boot berikutnya dan kita bisa tahu
-  // bahwa gerakan tersendat itu memang disebabkan reset.
+  // Flag in RTC memory that a move is in flight: if the ESP32 resets
+  // mid-move (e.g. brownout from motor noise) the flag survives to the next
+  // boot and identifies the stall as caused by that reset.
   markMoveStart();
   markMoveStartTimed();
 }
 
-// Kecepatan di-ramp naik dari 0 ke speedTarget, dan turun lagi mendekati
-// tujuan. Ini yang mencegah motor stall/getar saat start dan stop.
+// Speed ramps up from 0 to speedTarget and back down near the goal; this is
+// what prevents stall/vibration on start and stop.
 float stepperNextSpeed(Stepper &s) {
   long remaining = labs(s.targetStep - s.currentStep);
 
-  // ------------------------------------------------------------
-  //  RAMP YANG BENAR
-  // ------------------------------------------------------------
-  //  Bug versi lama: panjang ramp dibuat TETAP (400 step) sementara
-  //  kecepatan target berubah-ubah. Akibatnya pada kecepatan rendah (K300)
-  //  ramp menempati hampir separuh gerakan, dan deselerasi turun sampai
-  //  10% x 300 = 30 step/s -> terlalu lambat -> motor STALL di akhir
-  //  sehingga lid berhenti di ~84 derajat, bukan 90.
+  // ---- CORRECT RAMP ----
+  //  Old bug: ramp length was FIXED (400 steps) while the target speed
+  //  varied, so at low speed (K300) it filled nearly half the move and
+  //  deceleration fell to 10% x 300 = 30 step/s -- too slow, the motor
+  //  STALLED at the end and the lid stopped at ~84 deg instead of 90.
   //
-  //  Perbaikan:
-  //   1. Panjang ramp dibuat PROPORSIONAL terhadap kecepatan target,
-  //      dengan batas atas supaya gerakan tidak lambat.
-  //   2. Deselerasi tidak turun di bawah 35% kecepatan target.
-  //   3. Batas bawah kecepatan dinaikkan supaya motor tetap punya torsi.
+  //  Fix: (1) ramp length PROPORTIONAL to target speed, capped so moves are
+  //  not slow; (2) deceleration never drops below 35% of target; (3) raised
+  //  minimum speed so the motor keeps torque.
   //
-  //  Rambu tuning:
-  //   - Kalau lid berhenti SEBELUM target (seperti 84 dari 90 derajat):
-  //     motor stall di akhir. Turunkan RAMP_MIN_FRAC atau naikkan
-  //     SLOW_FLOOR_FRAC (jangan melambat terlalu pelan di akhir).
-  //   - Kalau gerakan awal terasa menyentak: naikkan RAMP_MIN_FRAC.
+  //  Tuning hints:
+  //   - Lid stops BEFORE target (84 of 90 deg): stall at the end. Lower
+  //     RAMP_MIN_FRAC or raise SLOW_FLOOR_FRAC.
+  //   - Jerky start: raise RAMP_MIN_FRAC.
 
-  // Panjang ramp proporsional kecepatan: makin cepat, makin panjang.
+  // Ramp length proportional to speed: faster = longer.
   float rampLenF = s.speedTarget * 0.5f;
-  if (rampLenF > RAMP_MAX_STEPS) rampLenF = RAMP_MAX_STEPS;   // jangan terlalu panjang
+  if (rampLenF > RAMP_MAX_STEPS) rampLenF = RAMP_MAX_STEPS;   // don't get too long
 
-  // --- Batas atas: ramp tidak boleh melebihi SEPARUH panjang gerakan ---
-  // (lihat penjelasan bug di bawah)
+  // --- Upper bound: ramp must not exceed HALF the move length ---
+  // (see the bug explanation below)
   {
     long setengahGerakan = remaining / 2;
     if (setengahGerakan < 1) setengahGerakan = 1;
     if ((long)rampLenF > setengahGerakan) rampLenF = (float)setengahGerakan;
   }
 
-  // --- Batas bawah diterapkan SETELAH pembatasan di atas ---
-  // PENTING: urutannya harus begini. Kalau RAMP_MIN_STEPS diterapkan
-  // lebih dulu, pembatasan separuh gerakan bisa menimpanya dan
-  // menghasilkan ramp yang lebih pendek dari minimum.
-  //
-  // Tapi batas bawah juga tidak boleh melebihi separuh gerakan: untuk
-  // gerakan sangat pendek (mis. jog 20 step), memaksa ramp 150 step
-  // membuat motor tidak pernah mencapai kecepatan penuh sama sekali.
+  // --- Lower bound applied AFTER the clamp above ---
+  // ORDER MATTERS: if RAMP_MIN_STEPS were applied first, the half-move clamp
+  // could override it and produce a ramp shorter than the minimum.
+  // The lower bound must also not exceed half the move: for very short moves
+  // (e.g. jog 20 steps) forcing a 150-step ramp means the motor never
+  // reaches full speed at all.
   if (rampLenF < RAMP_MIN_STEPS) {
     float maksRamp = (float)(remaining / 2);
     if (maksRamp < 1.0f) maksRamp = 1.0f;
@@ -1446,28 +1671,29 @@ float stepperNextSpeed(Stepper &s) {
   }
   if (rampLenF < 1.0f) rampLenF = 1.0f;
 
-  // ------------------------------------------------------------
-  //  BUG YANG DIPERBAIKI DI SINI
-  // ------------------------------------------------------------
-  //  SEBELUMNYA: panjang ramp tidak dibatasi oleh panjang gerakan.
-  //  Untuk gerakan 800 step dengan K1600, rampLen = 1600*0.5 = 800.
-  //  Akibatnya 'remaining < rampLen' bernilai BENAR dari step pertama,
-  //  sehingga motor langsung dikenai faktor perlambatan dan TIDAK PERNAH
-  //  mencapai kecepatan target.
+  // ---- BUG FIXED HERE ----
+  //  Before: ramp length was not bounded by the move length. For an 800-step
+  //  move at K1600, rampLen = 1600*0.5 = 800, so 'remaining < rampLen' was
+  //  true from the very first step and the motor was slowed from step one --
+  //  it NEVER reached target speed. Measured: average only 882 of 1600 (55%),
+  //  theory predicts 781 (49%) -- a match. The speed changed every step, so
+  //  the motor lost sync easily -> stuttering/vibration.
   //
-  //  Bukti terukur: kecepatan rata-rata hanya 882 dari 1600 (55%),
-  //  dan perhitungan teoretis memberi 781 (49%) — cocok.
-  //  Akibat lanjutannya: kecepatan berubah terus di setiap step sehingga
-  //  motor mudah kehilangan sinkronisasi -> gerakan tersendat/getar.
-  //
-  //  PERBAIKAN: rampLen tidak boleh melebihi SEPARUH panjang gerakan.
-  //  Separuh untuk akselerasi, separuh untuk deselerasi. Dengan begitu
-  //  motor SELALU punya bagian di tengah untuk berjalan pada kecepatan
-  //  penuh, dan profil kecepatannya berbentuk trapesium yang benar.
-  //  (pembatasan ini sudah dilakukan di atas, sebelum batas bawah)
+  //  FIX: rampLen may not exceed HALF the move length -- half accelerating,
+  //  half decelerating -- so the motor always has a middle section at full
+  //  speed and the profile is a proper trapezoid.
+  //  (this clamp is applied above, before the lower bound)
   const long rampLen = (long)rampLenF;
 
-  // Perlambat kalau sudah dekat tujuan
+  // ---- MINIMUM SPEED DURING THE RAMP ----
+  //  Computed AFTER rampLen is settled, and must not exceed the target speed:
+  //  if it did, the motor would jump from rest straight to that speed with no
+  //  acceleration, which for a stepper means total step loss -- it just buzzes
+  //  without turning.
+  float spsMin = SPEED_MIN_SPS;
+  if (spsMin > s.speedTarget) spsMin = s.speedTarget;
+
+  // Slow down near the goal
   float capSps = s.speedTarget;
   if (remaining < rampLen) {
     float frac = (float)remaining / (float)rampLen;
@@ -1476,11 +1702,9 @@ float stepperNextSpeed(Stepper &s) {
     if (slow < capSps) capSps = slow;
   }
 
-  // Naikkan bertahap menuju capSps.
-  //
-  // PENTING: accelPerStep dihitung dari rampLenF yang SEDANG berlaku.
-  // Karena rampLenF sekarang menyesuaikan panjang gerakan, nilai ini
-  // otomatis benar untuk gerakan pendek maupun panjang.
+  // Ramp up gradually toward capSps.
+  // accelPerStep is derived from the rampLenF currently in force, so it is
+  // automatically right for short and long moves alike.
   const float accelPerStep = s.speedTarget / rampLenF;
   if (s.speedCurrent < capSps) {
     s.speedCurrent += accelPerStep;
@@ -1489,59 +1713,63 @@ float stepperNextSpeed(Stepper &s) {
     s.speedCurrent = capSps;
   }
 
-  // Batas bawah: motor stepper butuh kecepatan minimum agar tetap punya
-  // torsi. Terlalu pelan justru mudah stall dan bergetar.
-  if (s.speedCurrent < SPEED_MIN_SPS) s.speedCurrent = SPEED_MIN_SPS;
+  // Floor: a stepper needs a minimum speed to keep torque; too slow stalls
+  // and vibrates. But it must not exceed the target speed, or the motor
+  // jumps from rest to that speed with no acceleration -- which makes the
+  // stepper sit still and just buzz (see spsMin above).
+  if (s.speedCurrent < spsMin) s.speedCurrent = spsMin;
   return s.speedCurrent;
 }
 
-// Hitung perioda berikutnya untuk satu motor.
+// Compute the next period for one motor.
 //
-// PENTING soal pengukuran jitter:
-// Kita TIDAK mengukur jitter dari selisih waktu antar-pulsa, karena
-// perioda pulsa MEMANG berubah sesuai ramp (motor naik/turun kecepatan).
-// Perubahan perioda itu bukan gangguan.
-//
-// Yang diukur adalah JITTER TASK: seberapa lama task stepper tertahan
-// sebelum sempat melayani pulsa. Caranya: setiap kali task dipanggil,
-// kita catat jarak waktu antar panggilan. Kalau jarak itu jauh lebih
-// besar dari yang diminta, berarti ada yang menahan task.
+// JITTER MEASUREMENT NOTE: we do NOT measure jitter as the interval between
+// pulses, because the pulse period genuinely changes with the ramp. What is
+// measured is TASK JITTER: how long the stepper task was held off before it
+// could service a pulse -- the gap between successive task calls. If that gap
+// is much larger than requested, something is blocking the task.
 static inline void stepperTick(Stepper &s, unsigned long now) {
   if (!s.moving) return;
 
-  // Fase 1: pulsa sedang HIGH -> turunkan setelah PULSE_MIN_US
+  // Phase 1: pulse is ACTIVE -> end it once the pulse width has elapsed.
+  // Width is PULSE_MIN_US, widened proportionally via PULSE_DUTY_PERSEN when
+  // the period is long (low speed), so the TB6600 optocoupler always has
+  // enough time to read the pulse. See PULSE_MIN_US above.
   if (s.pulseHigh) {
-    if (now - s.lastPulseUs < PULSE_MIN_US) return;
-    // Akhiri pulsa. Dengan common-anode 5V, "selesai" = kembali ke HIGH.
+    unsigned long lebarPulsa = PULSE_MIN_US;
+    {
+      unsigned long perioda = s.halfPeriodUs * 2UL;
+      if (perioda > 0) {
+        unsigned long proporsional = perioda * PULSE_DUTY_PERSEN / 100UL;
+        if (proporsional > lebarPulsa) lebarPulsa = proporsional;
+      }
+    }
+    if (now - s.lastPulseUs < lebarPulsa) return;
+    // End the pulse. With common-anode 5V, "done" = back to HIGH.
     digitalWrite(s.pinPul, PULSE_OFF);
     s.pulseHigh   = false;
     s.lastPulseUs = now;
     return;
   }
 
-  // Fase 2: tunggu sisa perioda, lalu naikkan pulsa lagi
+  // Phase 2: wait out the rest of the period, then raise the pulse again
   unsigned long elapsed = now - s.lastPulseUs;
   if (elapsed < s.halfPeriodUs) return;
 
-  // Ukur KELEBIHAN tunggu: berapa lama melewati jadwal.
-  //
-  // PENTING: pulsa PERTAMA dan KEDUA setelah gerakan dimulai sengaja
-  // TIDAK diukur. Alasannya:
-  //  - Pulsa pertama terjadi saat halfPeriodUs masih 0 / baru di-set.
-  //  - speedCurrent di-ramp naik dari nol, jadi perioda pulsa kedua
-  //    jauh lebih panjang dari perioda "normal".
-  // Keduanya transisi ramp yang sah, bukan gangguan. Kalau ikut diukur,
-  // selalu muncul "1 pulsa terlambat" yang menyesatkan dan membuat
-  // jitter maksimum terlihat buruk padahal pulsanya rapi.
-  //
-  // s.warmUp menyimpan sisa pulsa yang harus dilewati sebelum pengukuran
-  // dianggap sah.
+  // Measure the OVERSHOOT: how far past schedule we are.
+  // The FIRST and SECOND pulses after a move starts are deliberately NOT
+  // measured: the first fires while halfPeriodUs is still 0 / just set, and
+  // speedCurrent ramps from zero so the second period is far longer than
+  // normal. Both are legitimate ramp transitions, not disturbances; counting
+  // them produces a misleading "1 pulse late" that makes max jitter look bad
+  // when the pulses are in fact clean. s.warmUp holds the remaining pulses to
+  // skip before measurement counts.
   if (s.warmUp > 0) {
     s.warmUp--;
   } else {
     unsigned long over = elapsed - s.halfPeriodUs;
 
-    if (over < 50000UL) {        // di atas 50 ms = pause, bukan jitter
+    if (over < 50000UL) {        // above 50 ms = a pause, not jitter
       jitSumUs += (uint32_t)over;
       jitCount++;
       if (over > jitMaxUs) jitMaxUs = (uint32_t)over;
@@ -1549,45 +1777,51 @@ static inline void stepperTick(Stepper &s, unsigned long now) {
     }
   }
 
-  // Mulai pulsa. Dengan common-anode 5V, "pulsa" = tarik ke LOW.
+  // Start the pulse. With common-anode 5V, "pulse" = pull LOW.
   digitalWrite(s.pinPul, PULSE_ON);
   s.pulseHigh   = true;
   s.lastPulseUs = now;
   s.currentStep += s.dir;
   stepTotal++;
 
-  // ---- PERBAIKAN PRESISI: pastikan pulsa TERAKHIR selalu ditutup ----
+  // ---- PRECISION FIX: make sure the LAST pulse is always closed ----
+  //  The old code checked "target reached" after raising the pulse and
+  //  returned without lowering PUL, so PUL stayed ACTIVE (LOW for
+  //  common-anode) until the next move began. If that next move used a
+  //  DIFFERENT DIR, the TB6600 saw an edge on PUL at the same time DIR
+  //  changed and counted it as one extra step in the new direction. The motor
+  //  shifted one step (0.1125 deg) INCONSISTENTLY depending on timing --
+  //  the cause of "80 percent spot on, the rest shifted".
   //
-  // MASALAH YANG DIPERBAIKI DI SINI:
-  // Kode lama memeriksa "target tercapai" SETELAH menaikkan pulsa, lalu
-  // langsung `return` tanpa menurunkan pin PUL. Akibatnya pin PUL tetap
-  // tertahan di level AKTIF (LOW untuk common-anode) ketika gerakan
-  // selesai, dan baru dilepas saat gerakan berikutnya dimulai.
-  //
-  // Kalau gerakan berikutnya memakai DIR yang BERBEDA, driver TB6600
-  // melihat tepi pada pin PUL bersamaan dengan perubahan DIR, dan tepi
-  // itu dihitung sebagai satu langkah tambahan ke arah yang baru. Motor
-  // bergeser satu langkah (0.1125 derajat) secara TIDAK KONSISTEN,
-  // tergantung waktu. Ini penyebab "80 persen tepat, sisanya bergeser".
-  //
-  // Perbaikannya: begitu langkah terakhir dikirim, tunggu selebar pulsa
-  // minimum lalu TUTUP pulsanya. Dengan begitu pin PUL selalu kembali ke
-  // level idle sebelum gerakan berakhir, dan tidak ada tepi palsu saat
-  // DIR berubah.
+  //  Fix: once the last step is sent, wait one pulse width then CLOSE the
+  //  pulse, so PUL is always back to idle before the move ends and there is
+  //  no false edge when DIR changes.
   if (s.currentStep == s.targetStep) {
-    // Tunggu sampai lebar pulsa minimum terpenuhi, supaya TB6600 sempat
-    // membaca langkah terakhir ini.
+    // Wait out the pulse width so the TB6600 can read this last step. Same
+    // width as Phase 1 (min PULSE_MIN_US, wider for long periods): a
+    // different width here would make the last pulse shorter than the ones
+    // before it, and that pulse is the one most often lost since it decides
+    // the final position.
+    unsigned long lebarTerakhir = PULSE_MIN_US;
+    {
+      unsigned long perioda = s.halfPeriodUs * 2UL;
+      if (perioda > 0) {
+        unsigned long proporsional = perioda * PULSE_DUTY_PERSEN / 100UL;
+        if (proporsional > lebarTerakhir) lebarTerakhir = proporsional;
+      }
+    }
+
     unsigned long tunggu = micros();
-    while ((micros() - tunggu) < (PULSE_MIN_US + 2)) {
-      // putar singkat, jangan pakai delay() supaya tidak menyerahkan
-      // kendali ke task lain di tengah pulsa terakhir
+    while ((micros() - tunggu) < lebarTerakhir) {
+      // short spin; no delay() so control is not handed to another task
+      // in the middle of the last pulse
     }
 
     digitalWrite(s.pinPul, PULSE_OFF);
     s.pulseHigh   = false;
 
-    // Beri jeda kecil setelah tepi turun sebelum gerakan dianggap selesai.
-    // Ini memberi waktu driver menyelesaikan satu langkah terakhir.
+    // Small settle after the falling edge before the move is called done,
+    // giving the driver time to finish the final step.
     tunggu = micros();
     while ((micros() - tunggu) < 5) { }
 
@@ -1596,20 +1830,16 @@ static inline void stepperTick(Stepper &s, unsigned long now) {
     return;
   }
 
-  // ---- Ukur KESALAHAN perioda terhadap JADWAL SAAT ITU ----
-  //
-  // PENTING: pembacaan ini harus terjadi SEBELUM halfPeriodUs dihitung
-  // ulang untuk pulsa berikutnya. Kalau diletakkan setelahnya, yang
-  // dibandingkan adalah jadwal pulsa BERIKUTNYA, bukan jadwal yang baru
-  // saja dipakai menunggu. Akibatnya angkanya tidak bermakna.
-  //
-  // Jangan juga bandingkan dengan stepSpeedActive, karena selama ramp
-  // kecepatannya berubah-ubah. Jadwal yang sah saat ini adalah
-  // halfPeriodUs: error = elapsed - halfPeriodUs.
+  // ---- Measure PERIOD ERROR against the CURRENT schedule ----
+  // This reading must happen BEFORE halfPeriodUs is recomputed for the next
+  // pulse; after that the comparison is against the NEXT pulse's schedule,
+  // not the one just waited out, which makes the number meaningless.
+  // Do not compare against stepSpeedActive either: during a ramp the speed
+  // changes. The valid schedule is halfPeriodUs: error = elapsed - halfPeriodUs.
   {
     long err = (long)elapsed - (long)s.halfPeriodUs;
 
-    // Abaikan pulsa pertama (halfPeriodUs belum bermakna)
+    // Ignore the first pulse (halfPeriodUs is not meaningful yet)
     if (gPeriodLastUs != 0 && err > -100000L && err < 100000L) {
       if (err > (long)gPeriodMaxUs)  gPeriodMaxUs = (uint32_t)err;
       if (err < (long)gPeriodMinUs)  gPeriodMinUs = (uint32_t)err;
@@ -1618,9 +1848,9 @@ static inline void stepperTick(Stepper &s, unsigned long now) {
       gPeriodSumUs += a;
       gPeriodCount++;
 
-      // Catat di PULSA KE-BERAPA lonjakan besar terjadi. Ini yang
-      // membedakan "lonjakan saat mulai" (transisi ramp, wajar) dari
-      // "lonjakan di tengah" (macet, penyebab tersendat).
+      // Record on which PULSE a large spike occurred: this separates a
+      // start spike (ramp transition, harmless) from a mid-move spike
+      // (a block, the cause of stuttering).
       if (err > 500) {
         gLonjakCount++;
         if (gLonjakPertamaPulsa == 0) {
@@ -1637,7 +1867,7 @@ static inline void stepperTick(Stepper &s, unsigned long now) {
   }
   gPeriodLastUs = now;
 
-  // Hitung kecepatan berikutnya (ramp) untuk perioda berikutnya
+  // Compute the next speed (ramp) for the next period
   float sps = stepperNextSpeed(s);
   s.halfPeriodUs = (unsigned long)(500000.0 / sps);
   if (s.halfPeriodUs < (PULSE_MIN_US + 2)) {
@@ -1646,67 +1876,52 @@ static inline void stepperTick(Stepper &s, unsigned long now) {
 }
 
 // ============================================================
-//  TASK STEPPER DI CORE 1  (inti perbaikan jitter)
+//  STEPPER TASK ON CORE 1  (the core of the jitter fix)
 // ============================================================
 //
-//  MASALAH: kalau pulsa stepper dikeluarkan dari loop() atau dari timer
-//  yang berjalan di core 0 (core WiFi), maka setiap request HTTP menunda
-//  pulsa -> gerakan tersentak (jitter).
+//  Problem: if stepper pulses come from loop() or a timer on core 0 (the
+//  WiFi core), every HTTP request delays a pulse -> jerky motion.
+//  Measured before the fix: max jitter 1156 us, 215 of 3128 pulses late
+//  by >50 us.
 //
-//  Uji nyata sebelum perbaikan ini: jitter maksimum 1156 us,
-//  215 dari 3128 pulsa terlambat >50 us.
-//
-//  SOLUSI: jalankan loop pulsa di CORE 1 dengan prioritas tinggi.
-//  WiFi/HTTP Arduino berjalan di CORE 0, jadi keduanya tidak saling
-//  mengganggu. Ini menjadikan pulsa jauh lebih konsisten.
-//
-//  Delay memakai vTaskDelayUntil pada tick 1 ms, dibantu
-//  delayMicroseconds untuk presisi di bawah 1 ms — keduanya tidak
-//  memblokir core lain.
+//  Solution: run the pulse loop on CORE 1 at high priority. Arduino
+//  WiFi/HTTP runs on core 0, so the two do not disturb each other.
 
 TaskHandle_t stepperTaskHandle = nullptr;
 
-// ---- Instrumentasi: ukur waktu yang dihabiskan task stepper sendiri ----
-volatile uint32_t spinLoopCnt   = 0;   // berapa kali putaran spin
-volatile uint32_t spinMaxUs     = 0;   // putaran spin terpanjang (us)
-volatile uint32_t yieldLateMax  = 0;   // keterlambatan setelah taskYIELD (us)
-volatile uint32_t delayLateMax  = 0;   // keterlambatan setelah vTaskDelayUntil (us)
+// ---- Instrumentation: time spent by the stepper task itself ----
+volatile uint32_t spinLoopCnt   = 0;   // number of spin iterations
+volatile uint32_t spinMaxUs     = 0;   // longest spin iteration (us)
+volatile uint32_t yieldLateMax  = 0;   // lateness after taskYIELD (us)
+volatile uint32_t delayLateMax  = 0;   // lateness after vTaskDelayUntil (us)
 
-// Loop pulsa. Berjalan di core 1.
+// Pulse loop. Runs on core 1.
 //
-// PENTING: strategi di sini adalah BERPUTAR (spin) selama motor bergerak,
-// TANPA memanggil taskYIELD atau delay. Alasannya: pada core 1, taskYIELD
-// bisa tidak langsung kembali (task lain mengambil alih), dan itu membuat
-// pulsa tertunda milidetik. Dengan spin murni + micros(), pulsa keluar
-// tepat waktu selama motor bergerak. Saat motor diam, task tidur penuh
-// sehingga tidak membuang CPU.
+// IMPORTANT: the strategy here is to SPIN while a motor is moving, with no
+// taskYIELD or delay. On core 1, taskYIELD may not return promptly (another
+// task takes over), which delays pulses by milliseconds. Pure spin + micros()
+// emits pulses on time for the whole move. When idle the task sleeps fully so
+// it wastes no CPU.
 void stepperTaskCore1(void* param) {
   for (;;) {
-    // ---- MODE GERAK: spin presisi, TANPA tidur ----
-    // Selama ada motor bergerak, task ini tidak tidur sama sekali.
-    //
-    // Ini penting: vTaskDelayUntil memakai resolusi tick 1 ms, sedangkan
-    // perioda pulsa bisa 0,83 ms (K600) atau lebih kecil. Kalau task tidur
-    // di antara pulsa, pulsa berikutnya harus menunggu tick berikutnya dan
-    // jitter rata-rata terukur ~490 us (hampir separuh tick) — terbukti
-    // dari pengujian, dan itulah penyebab gerakan tersentak.
-    //
-    // Dengan spin penuh selama gerakan, jitter rata-rata ~0,2 us.
-    // Trade-off: core 1 terpakai penuh selama lid bergerak. Wajar, karena
-    // gerakan hanya berlangsung <2 detik dan core 1 memang disediakan
-    // khusus untuk ini (WiFi ada di core 0).
+    // ---- MOVING MODE: precise spin, NO sleep ----
+    // While any motor moves this task never sleeps: vTaskDelayUntil has 1 ms
+    // tick resolution while the pulse period can be 0.83 ms (K600) or less,
+    // so sleeping between pulses makes the next pulse wait for the next tick,
+    // giving ~490 us measured average jitter (nearly half a tick) -- the
+    // cause of jerky motion. Full spin gives ~0.2 us average jitter.
+    // Trade-off: core 1 is fully used while the lid moves, which is fine:
+    // moves last <2 s and core 1 exists for this (WiFi is on core 0).
     if (stLidLeft.moving || stLidRight.moving) {
       spinLoopCnt++;
       unsigned long t0 = micros();
-      unsigned long guard = 0;
 
       while (stLidLeft.moving || stLidRight.moving) {
         unsigned long now = micros();
 
-        // Hanya proses motor yang SEDANG bergerak. Memanggil untuk motor
-        // diam sebenarnya langsung 'return', tapi memanggil hanya yang
-        // aktif mengurangi jumlah pemanggilan fungsi per iterasi dan
-        // membuat loop lebih ringan.
+        // Only service motors that ARE moving. Calling a stopped motor would
+        // just return immediately, but skipping it cuts the number of calls
+        // per iteration and makes the loop lighter.
         if (tickHanyaMotorAktif) {
           if (stLidLeft.moving)  stepperTick(stLidLeft,  now);
           if (stLidRight.moving) stepperTick(stLidRight, now);
@@ -1715,14 +1930,27 @@ void stepperTaskCore1(void* param) {
           stepperTick(stLidRight, now);
         }
 
-        // Pengaman anti-macet: kalau masih bergerak setelah ~3 detik,
-        // paksa berhenti supaya tidak ada lid yang jalan tanpa kendali.
-        if (++guard > 3000000UL) {
+        // Anti-stuck guard: if still moving past the time limit, force a stop
+        // so no lid runs out of control.
+        //
+        // IMPORTANT: this guard uses TIME, not a loop-iteration count. It used
+        // a fixed count (> 3000000), which was wrong because that time limit
+        // shifted whenever STEPS_PER_REV (microstep) changed. Real case: after
+        // the microstep change to 1/8, test command E400 (=90 degrees) at 100
+        // step/s needs 4.0 s, and the old counter cut it at ~3 s, stopping at
+        // 389 of 400 pulses and printing "[ERROR] Stepper >3s" -- although the
+        // pulses emitted were perfect (max jitter 2 us). The guard was wrong,
+        // not the motor or driver.
+        //
+        // 30 s is far above the longest legitimate move: 120 degrees at SLOW
+        // 200 step/s is 533 steps = 2.7 s, so 30 s is never reached by a valid
+        // move but still stops a truly stuck motor.
+        if (micros() - t0 > 30000000UL) {
           stLidLeft.moving  = false;
           stLidRight.moving = false;
           stepperRelease(stLidLeft);
           stepperRelease(stLidRight);
-          addLog("[ERROR] Stepper >3s - dihentikan paksa");
+          addLog("[ERROR] Stepper >30s - dihentikan paksa");
           break;
         }
       }
@@ -1730,18 +1958,17 @@ void stepperTaskCore1(void* param) {
       uint32_t spent = (uint32_t)(micros() - t0);
       if (spent > spinMaxUs) spinMaxUs = spent;
 
-      // Kedua motor selesai dengan benar -> hapus penanda di RTC memory.
-      // Selama gerakan berlangsung penanda tetap ada, jadi reset di
-      // tengah gerakan akan terlihat pada boot berikutnya.
+      // Both motors finished cleanly -> clear the RTC memory flag. The flag
+      // stays set for the whole move, so a reset mid-move is visible on the
+      // next boot.
       if (!stLidLeft.moving && !stLidRight.moving) {
         markMoveEnd();
-        gMoveEndUs = micros();   // catat akhir gerakan SEBELUM dihitung
+        gMoveEndUs = micros();   // record the move end BEFORE computing
 
-        // ---- UKUR PRESISI ----
-        // Bandingkan langkah yang DIMINTA dengan langkah yang benar-benar
-        // dikirim. Kalau keduanya sama, gerakan presisi. Selisih di sini
-        // berarti ada langkah yang tidak terkirim, dan itu penyebab
-        // "titik berhenti yang bergeser".
+        // ---- PRECISION MEASUREMENT ----
+        // Compare steps REQUESTED with steps actually sent. Equal means the
+        // move was precise; a difference means steps were dropped, which is
+        // what shifts the stopping point.
         {
           int32_t selisih = (int32_t)gMoveLastSteps - (int32_t)gMoveReqSteps;
           if (selisih < 0) selisih = -selisih;
@@ -1761,9 +1988,8 @@ void stepperTaskCore1(void* param) {
           }
         }
 
-        // Hitung kecepatan rata-rata AKTUAL dari durasi gerakan.
-        // Kalau jauh di bawah yang diminta, ada indikasi kehilangan
-        // langkah atau pulsa tidak keluar rapi.
+        // Compute the ACTUAL average speed from the move duration. Far below
+        // the requested speed indicates lost steps or ragged pulses.
         if (gMoveStartUs && gMoveEndUs > gMoveStartUs) {
           unsigned long durUs = gMoveEndUs - gMoveStartUs;
           uint32_t      steps = (uint32_t)(stepTotal - gMoveStepsAtStart);
@@ -1772,7 +1998,7 @@ void stepperTaskCore1(void* param) {
             gMoveLastSpeed = aktual;
             gMoveLastSteps = steps;
 
-            // Tampilkan hanya kalau menarik (perbedaan > 20%)
+            // Only show it when interesting (> 20% off)
             float diminta = stepSpeedActive;
             if (aktual < diminta * 0.8f) {
               addLogf("[HATI] Gerakan %.0f step/s aktual, diminta %.0f "
@@ -1783,9 +2009,9 @@ void stepperTaskCore1(void* param) {
                       aktual, diminta);
             }
 
-            // Tampilkan KESALAHAN JADWAL pulsa. Inilah ukuran yang sah:
-            // dibandingkan dengan jadwal SAAT ITU (halfPeriodUs), bukan
-            // dengan stepSpeedActive yang tidak berlaku selama ramp.
+            // Show the PULSE SCHEDULE error -- the valid metric: compared
+            // against the schedule in force (halfPeriodUs), not against
+            // stepSpeedActive, which does not hold during a ramp.
             if (gPeriodCount > 0) {
               unsigned long pAvg = gPeriodSumUs / gPeriodCount;
               addLogf("[JADWAL] selisih rata2=%lu us, min=%ld max=%ld "
@@ -1801,7 +2027,7 @@ void stepperTaskCore1(void* param) {
                 addLog("[OK] Pulsa keluar tepat sesuai jadwal saat itu.");
               }
 
-              // Laporkan LONJAKAN: ini yang menyebabkan sentakan.
+              // Report SPIKES: these are what cause the jerk.
               if (gLonjakCount > 0) {
                 addLogf("[LONJAK] %lu pulsa macet >500us. "
                         "Terbesar %lu us di step %lu. "
@@ -1813,9 +2039,8 @@ void stepperTaskCore1(void* param) {
                         (unsigned long)gLonjakPertamaPulsa,
                         (unsigned long)gLonjakPosisiStep);
 
-                // Kalau macet pertama terjadi di pulsa ke-1 atau 2,
-                // itu transisi ramp dan tidak berbahaya.
-                // Kalau di tengah gerakan, itu penyebab tersendat.
+                // A first stall on pulse 1 or 2 is a ramp transition and
+                // harmless; mid-move it is the cause of stuttering.
                 if (gLonjakPertamaPulsa <= 3) {
                   addLog("[LONJAK] Macet terjadi di AWAL gerakan "
                          "(transisi ramp) - tidak berbahaya.");
@@ -1830,23 +2055,23 @@ void stepperTaskCore1(void* param) {
           }
         }
       }
-      continue;   // langsung periksa lagi, tanpa tidur
+      continue;   // check again immediately, without sleeping
     }
 
-    // ---- MODE DIAM: tidur, tidak membuang CPU ----
+    // ---- IDLE MODE: sleep, waste no CPU ----
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
 void stepperTaskStart() {
   BaseType_t ok = xTaskCreatePinnedToCore(
-      stepperTaskCore1,      // fungsi task
-      "stepper",             // nama
+      stepperTaskCore1,      // task function
+      "stepper",             // name
       4096,                  // stack
-      nullptr,               // argumen
-      3,                     // prioritas (lebih tinggi dari loop Arduino)
+      nullptr,               // argument
+      3,                     // priority (higher than the Arduino loop)
       &stepperTaskHandle,
-      STEPPER_CORE);         // core 1, bukan core WiFi
+      STEPPER_CORE);         // core 1, not the WiFi core
 
   if (ok == pdPASS) {
     addLogf("[OK] Task stepper di core %d (anti-jitter)", STEPPER_CORE);
@@ -1857,9 +2082,8 @@ void stepperTaskStart() {
 
 bool stepperBusy() { return stLidLeft.moving || stLidRight.moving; }
 
-// Apakah ada pulsa yang sudah jatuh tempo sekarang?
-// Dipakai task stepper untuk menentukan perlu spin atau boleh tidur.
-// Kalau tidak ada yang jatuh tempo, tidak perlu berputar menahan CPU.
+// Is any pulse due right now? Used by the stepper task to decide whether to
+// spin or sleep; nothing due means no need to burn CPU.
 static inline bool stepperAnyDueNow() {
   unsigned long now = micros();
 
@@ -1884,45 +2108,45 @@ static inline bool stepperAnyDueNow() {
   return false;
 }
 
-// Gerakkan HANYA satu lid.
+// Move ONLY one lid.
 void lidToDeg(Stepper &s, float deg, float speed) {
   stepperMoveToDeg(s, deg, speed);
 }
 
-// Gerakkan KEDUA lid bersamaan. Dipakai oleh perintah C/S.
+// Move BOTH lids together. Used by the C/S commands.
 void lidBothToDeg(float deg, float speed) {
   stepperMoveToDeg(stLidLeft,  deg, speed);
   stepperMoveToDeg(stLidRight, deg, speed);
 }
 
-// Terapkan profil kecepatan ke seluruh robot.
+// Apply a speed profile to the whole robot.
 //
-// Dipanggil saat pengguna menekan tombol SLOW/MEDIUM/FAST, dan saat
-// robot menyala untuk memulihkan pilihan terakhir. Kalau `simpan`
-// bernilai true, pilihannya ditulis ke flash supaya tidak hilang.
+// Called when the user presses SLOW/MEDIUM/FAST and at boot to restore the
+// last choice. If `simpan` is true the choice is written to flash so it
+// survives.
 void simpanProfil();
 void pilihProfil(uint8_t p, bool simpan) {
   if (p > 2) p = PROFIL_MEDIUM;
   profilAktif = p;
 
-  // Kecepatan tutup mengikuti profil
-  stepSpeedActive = PROFIL[p].stepSps;
-
-  // Kecepatan roda juga mengikuti, supaya "slow" berarti slow
-  // untuk seluruh robot, bukan hanya tutupnya.
+  // ONLY wheel speed follows the profile. stepSpeedActive is deliberately
+  // left untouched: the stepper is independent. Wheel speed is about driving
+  // comfort, lid speed about torque and gear precision -- combining them
+  // would make "SLOW" also slow the lid, and "FAST" could make the lid lose
+  // steps.
   speedPWM = PROFIL[p].pwmRoda;
 
-  // Kalau roda sedang berjalan, kecepatan baru langsung dipakai.
+  // If the wheels are moving, apply the new speed immediately.
   if (moveMode != MOVE_STOP) motorApply();
 
-  addLogf("[PROFIL] %s - tutup %.0f step/s, roda PWM %d",
-          PROFIL[p].nama, stepSpeedActive, speedPWM);
+  addLogf("[PROFIL] Roda %s - PWM %d (stepper tetap %.0f step/s)",
+          PROFIL[p].nama, speedPWM, stepSpeedActive);
 
   if (simpan) simpanProfil();
 }
 
-// Simpan setelan motor penggerak ke flash. Dipanggil setiap kali ada
-// yang diubah, supaya tidak hilang saat ESP32 dimatikan.
+// Save drive motor settings to flash. Called on every change so they
+// survive a power-off.
 void simpanMotor() {
   Preferences p;
   if (!p.begin("trashbin", false)) return;
@@ -1937,21 +2161,26 @@ void simpanMotor() {
   p.end();
 }
 
-// Simpan hanya pilihan profil. Dipakai saat tombol kecepatan ditekan.
+// Save only the profile choice. Used when a speed button is pressed.
 void simpanProfil() {
   Preferences p;
   if (!p.begin("trashbin", false)) return;
-  p.putUChar("profil", profilAktif);
+  p.putUChar("profil",  profilAktif);
+  p.putFloat("stepSps", stepSpeedActive);
+  // Also write the microstep marker: the stored speed is only valid for the
+  // microstep the firmware currently uses, so both must be saved together.
+  // Without this marker the next boot would assume the speed came from a
+  // different microstep and discard it.
+  p.putUChar("dipMicro", DIP_TERAKHIR);
   p.end();
 }
 
-// Nama lama untuk simpanMotor(), dipertahankan supaya bagian kode
-// yang lama tidak perlu diubah semuanya.
+// Old name for simpanMotor(), kept so older code does not all need changing.
 void simpanArahMotor() {
   simpanMotor();
 }
 
-// Muat pilihan profil dari flash saat robot menyala.
+// Load the profile choice from flash at boot.
 void muatProfil() {
   Preferences p;
   if (!p.begin("trashbin", true)) {
@@ -1960,22 +2189,98 @@ void muatProfil() {
   }
 
   uint8_t v = p.getUChar("profil", PROFIL_MEDIUM);
+
+  // Stepper speed is loaded separately because the stepper is independent of
+  // the wheel profile, and so a value stored before the profile struct
+  // changed is still readable.
+  //
+  // IMPORTANT: a stored value can come from old settings that no longer fit,
+  // and the magnitude does not always reveal it. Real example: 600 was stored
+  // while the firmware used 1/16 microstep; at 1/8 the same 600 means the lid
+  // moves TWICE as fast. 600 itself still looks plausible (within 50..4000),
+  // so a range check alone cannot catch it. Hence the microstep marker: if
+  // DIP_TERAKHIR differs from the stored value, the firmware was re-uploaded
+  // with a different microstep assumption, and the old speed MUST NOT be
+  // used because it was computed for a different pulses-per-degree.
+  float sps = p.getFloat("stepSps", STEP_DEFAULT_SPS);
+
+  uint8_t dipTersimpan = p.getUChar("dipMicro", 0);
+
   p.end();
 
   if (v > 2) v = PROFIL_MEDIUM;
   pilihProfil(v, false);
+
+  bool microstepBerubah = (dipTersimpan != DIP_TERAKHIR);
+
+  if (microstepBerubah) {
+    if (dipTersimpan != 0) {
+      // Value stored but from another microstep -> discard.
+      addLogf("[STEP] Microstep berubah (%u -> %u). Kecepatan lama %.0f",
+              (unsigned)dipTersimpan, (unsigned)DIP_TERAKHIR,
+              sps);
+      addLogf("[STEP] dibuang karena dihitung untuk 1/%u, pakai default %.0f",
+              (unsigned)dipTersimpan, STEP_DEFAULT_SPS);
+    } else {
+      // No marker (old firmware / fresh flash): the stored speed cannot be
+      // trusted -> use default.
+      addLogf("[STEP] Belum ada penanda microstep. Kecepatan tersimpan %.0f",
+              sps);
+      addLogf("[STEP] tidak dipakai, pakai default %.0f", STEP_DEFAULT_SPS);
+    }
+    sps = STEP_DEFAULT_SPS;
+
+    // Store the marker so the next boot does not see a change.
+    Preferences pw;
+    if (pw.begin("trashbin", false)) {
+      pw.putUChar("dipMicro", DIP_TERAKHIR);
+      pw.putFloat("stepSps", sps);
+      pw.end();
+    }
+  } else if (sps < 50.0f || sps > 4000.0f) {
+    addLogf("[STEP] Kecepatan tersimpan %.0f tidak masuk akal - pakai default %.0f",
+            sps, STEP_DEFAULT_SPS);
+    sps = STEP_DEFAULT_SPS;
+  }
+
+  stepSpeedActive = sps;
+
+  addLogf("[STEP] Kecepatan stepper dari memori = %.0f step/s", stepSpeedActive);
+  addLogf("[STEP] Microstep firmware = 1/%u (%u pulsa/putaran)",
+          (unsigned)DIP_TERAKHIR, (unsigned)STEPS_PER_REV);
 }
 
 // ------------------------------------------------------------
-//  SIMPAN / MUAT SUDUT GLOBAL KE FLASH (NVS)
+//  SAVE / LOAD GLOBAL ANGLE TO FLASH (NVS)
 // ------------------------------------------------------------
-//  Supaya sudut yang sudah diatur tidak hilang saat ESP32 dimatikan.
-//  Kalau belum pernah diatur, dipakai LID_ANGLE_DEF.
+//  So a configured angle survives power-off. LID_ANGLE_DEF is used if it was
+//  never set.
+//
+//  Flash writes are DEFERRED, never done inline from a command handler. An NVS
+//  write is a SPI flash operation, and Espressif documents that caches are
+//  disabled during SPI1 work and other tasks are suspended while the other core
+//  busy-waits. A write issued while a lid is moving can therefore stall the
+//  pulse task and drop steps. Handlers set gSudutKotor instead; flushKotor()
+//  runs from loop() once the motors are idle.
 void simpanSudutGlobal() {
   Preferences p;
   if (!p.begin("trashbin", false)) return;
   p.putFloat("lidAngle", lidAngleGlobal);
   p.end();
+}
+
+// Set by the 'W' handler. The value is in RAM immediately and only the saving
+// waits, so behaviour is unchanged if power is cut before the flush -- the
+// compromise is an unsaved angle, not a wrong one.
+bool gSudutKotor = false;
+
+// Write a pending angle once nothing is moving. Called every loop().
+void flushKotor() {
+  if (!gSudutKotor)   return;
+  if (stepperBusy())  return;   // never write flash mid-move
+  simpanSudutGlobal();
+  gSudutKotor = false;
+  addLogf("[SUDUT] Sudut global %.1f derajat tersimpan", lidAngleGlobal);
 }
 
 void muatSudutGlobal() {
@@ -1987,8 +2292,7 @@ void muatSudutGlobal() {
 
   float v = p.getFloat("lidAngle", LID_ANGLE_DEF);
 
-  // Sekalian muat setelan motor penggerak, karena keduanya
-  // disimpan di tempat yang sama.
+  // Also load the drive motor settings, stored in the same place.
   motorBalikKiri  = p.getBool("balikKiri",  false);
   motorBalikKanan = p.getBool("balikKanan", false);
 
@@ -1996,7 +2300,7 @@ void muatSudutGlobal() {
   pwmKompensasiKanan = p.getChar("kompKanan", (int8_t)0);
   tambahanBelok      = p.getUChar("tambahBelok", (uint8_t)45);
 
-  // Jaga-jaga kalau nilai di flash rusak atau di luar batas.
+  // Guard against corrupted or out-of-range flash values.
   if (pwmKompensasiKiri  < -KOMPENSASI_MAKS) pwmKompensasiKiri  = -KOMPENSASI_MAKS;
   if (pwmKompensasiKiri  >  KOMPENSASI_MAKS) pwmKompensasiKiri  =  KOMPENSASI_MAKS;
   if (pwmKompensasiKanan < -KOMPENSASI_MAKS) pwmKompensasiKanan = -KOMPENSASI_MAKS;
@@ -2017,11 +2321,9 @@ void muatSudutGlobal() {
           (int)tambahanBelok);
 }
 
-// ==================== LOGIKA PERINTAH (dipakai WiFi & BLE) ====================
-
+// ==================== COMMAND LOGIC (shared by WiFi & BLE) ====================
 void executeCommand(char cmd, const String &arg) {
-  lastCmdMillis = millis();      // reset watchdog tiap ada perintah
-
+  lastCmdMillis = millis();      // watchdog reset on any command
   switch (cmd) {
     case 'F': moveMode = MOVE_FWD;   motorApply(); break;
     case 'B': moveMode = MOVE_BACK;  motorApply(); break;
@@ -2029,65 +2331,111 @@ void executeCommand(char cmd, const String &arg) {
     case 'R': moveMode = MOVE_RIGHT; motorApply(); break;
     case 'P': moveMode = MOVE_STOP;  motorStop();  break;
 
-    // ============================================================
-    //  'N' = PILIH PROFIL KECEPATAN  (SLOW / MEDIUM / FAST)
-    // ============================================================
-    //  Format:  N<0|1|2>   atau   N<slow|medium|fast>
-    //    N0 / NSLOW    -> profil SLOW
-    //    N1 / NMEDIUM  -> profil MEDIUM
-    //    N2 / NFAST    -> profil FAST
-    //
-    //  Satu profil mengatur kecepatan roda DAN kecepatan tutup sekaligus,
-    //  supaya "slow" berlaku untuk seluruh robot.
-    //  Pilihan ini disimpan di flash.
+    // 'N' = select speed profile (SLOW/MEDIUM/FAST). N<0|1|2> or N<slow|medium|fast>.
+    // One profile sets both wheel and lid speed; saved to flash.
     case 'N': {
       String a = arg;
       a.toUpperCase();
       a.trim();
-
       int p = -1;
-
       if (a.startsWith("SLOW"))        p = PROFIL_SLOW;
       else if (a.startsWith("MEDIUM")) p = PROFIL_MEDIUM;
       else if (a.startsWith("FAST"))   p = PROFIL_FAST;
       else if (a.length() > 0)         p = a.toInt();
-
       if (p < 0 || p > 2) {
         addLog("[MOTOR] Profil harus SLOW, MEDIUM, FAST, atau 0-2");
         break;
       }
-
       pilihProfil((uint8_t)p, true);
       break;
     }
 
-    // ============================================================
-    //  'Q' = UJI KECEPATAN BERTAHAP (SWEEP)
-    // ============================================================
-    //  Mencari pada kecepatan berapa motor mulai kehilangan langkah.
-    //
-    //    Q   atau QL  -> uji lid KIRI
-    //    QR           -> uji lid KANAN
-    //    QB           -> uji KEDUA lid
-    //
-    //  PENTING: torsi TIDAK BISA diubah dari firmware. Uji ini
-    //  mengukur batas kecepatan, bukan menambah tenaga. Untuk menambah
-    //  tenaga harus mengubah arus di DIP switch TB6600, lihat catatan
-    //  lengkap di atas fungsi sweepKecepatan().
+    // 'Q' = stepped speed sweep: finds the speed at which the motor starts losing
+    // steps. Q/QL left, QR right, QB both. Torque is NOT settable from firmware,
+    // so this measures a speed limit, not added power; torque means changing the
+    // TB6600 DIP-switch current (see sweepKecepatan()).
     case 'Q': {
       String a = arg;
       a.toUpperCase();
-
       bool kiri  = (a.indexOf('L') >= 0) || (a.indexOf('R') < 0);
       bool kanan = (a.indexOf('R') >= 0) || (a.indexOf('L') < 0);
-
       addLog("[SWEEP] Mulai... motor akan bergerak bolak-balik.");
       addLog("[SWEEP] Jangan matikan robot selama uji berjalan.");
-
       if (kiri)  sweepKecepatan(stLidLeft,  "KIRI");
       if (kanan) sweepKecepatan(stLidRight, "KANAN");
-
       addLog("[SWEEP] Selesai. Lihat hasilnya di log di atas.");
+      break;
+    }
+
+    // 'E' = slow pin-signal test (no load): separates firmware faults from wiring
+    // faults when the stepper never moves. E/EL left, ER right, EB both, E<n>
+    // pulses. 100 step/s so movement is visible by eye. Default 400 pulses = 90
+    // deg at 1/8 microstep, tracking STEPS_PER_REV (800 pulses at 1/16).
+    case 'E': {
+      String a = arg;
+      a.toUpperCase();
+      uint32_t jumlah = 400;
+      int angkaMulai = -1;
+      for (unsigned i = 0; i < a.length(); i++) {
+        if (a.charAt(i) >= '0' && a.charAt(i) <= '9') { angkaMulai = i; break; }
+      }
+      if (angkaMulai >= 0) {
+        long v = a.substring(angkaMulai).toInt();
+        if (v < 10)   v = 10;
+        if (v > 3200) v = 3200;
+        jumlah = (uint32_t)v;
+      }
+      bool kiri  = (a.indexOf('L') >= 0) || (a.indexOf('R') < 0);
+      bool kanan = (a.indexOf('R') >= 0) || (a.indexOf('L') < 0);
+      addLog("[UJIPIN] Mulai. Motor akan bergerak SANGAT pelan.");
+      addLog("[UJIPIN] Perhatikan: apakah motor bergerak, dan apakah ada bunyi.");
+      if (kiri)  ujiSinyalPin(stLidLeft,  "KIRI",  jumlah, 100.0f);
+      if (kanan) ujiSinyalPin(stLidRight, "KANAN", jumlah, 100.0f);
+      addLog("[UJIPIN] Selesai.");
+      break;
+    }
+
+    // 'U' = ENA polarity test for motors that hold stiff but never turn: tries both
+    // ENA polarities in sequence, so watch which attempt rotates.
+    // U left, UR right, UB both.
+    case 'U': {
+      String a = arg;
+      a.toUpperCase();
+      bool kiri  = (a.indexOf('L') >= 0) || (a.indexOf('R') < 0);
+      bool kanan = (a.indexOf('R') >= 0) || (a.indexOf('L') < 0);
+      // Hold mode off first so it does not mask the result.
+      if (holdMode) {
+        addLog("[UJIENA] Mode tahan sedang AKTIF - dimatikan dulu untuk uji.");
+        holdMode = false;
+      }
+      if (kiri)  ujiPolaritasEna(stLidLeft,  "KIRI");
+      if (kanan) ujiPolaritasEna(stLidRight, "KANAN");
+      break;
+    }
+
+    // 'T' = force motor release (stiff-motor diagnosis): disables hold, forces ENA
+    // to its free level, then you turn the shaft by hand. Distinguishes "firmware
+    // holds it" from "ENA polarity inverted". T left, TR right, TB both.
+    case 'T': {
+      String a = arg;
+      a.toUpperCase();
+      bool kiri  = (a.indexOf('L') >= 0) || (a.indexOf('R') < 0);
+      bool kanan = (a.indexOf('R') >= 0) || (a.indexOf('L') < 0);
+      if (kiri)  ujiLepasMotor(stLidLeft,  "KIRI");
+      if (kanan) ujiLepasMotor(stLidRight, "KANAN");
+      break;
+    }
+
+    // 'J' = physical pin test: reads pin levels back with digitalRead, not just
+    // writes. For when the log reports full pulses but the motor stays still.
+    // J left (PUL=18 DIR=19 ENA=23), JR right (PUL=15 DIR=4 ENA=5), JB both.
+    case 'J': {
+      String a = arg;
+      a.toUpperCase();
+      bool kiri  = (a.indexOf('L') >= 0) || (a.indexOf('R') < 0);
+      bool kanan = (a.indexOf('R') >= 0) || (a.indexOf('L') < 0);
+      if (kiri)  ujiPinFisik(stLidLeft,  "LID KIRI");
+      if (kanan) ujiPinFisik(stLidRight, "LID KANAN");
       break;
     }
 
@@ -2119,30 +2467,23 @@ void executeCommand(char cmd, const String &arg) {
       lidBothToDeg(0.0f, stepSpeedActive);
       break;
 
-    // 'I' = kendalikan lid PER SATU SISI.
-    //   IL1 / IL0  -> buka / tutup lid KIRI saja
-    //   IR1 / IR0  -> buka / tutup lid KANAN saja
-    //   IL1R1      -> kombinasi, keduanya bisa digabung dalam satu perintah
-    // Argumen dipakai supaya tidak bentrok dengan 'L'/'R' (pivot roda).
+    // 'I' = per-side lid control: IL1/IL0 left, IR1/IR0 right, IL1R1 combined.
+    // A side argument is required so it cannot clash with the 'L'/'R' pivots.
     case 'I': {
       if (arg.length() == 0) {
         addLog("[LID] Perintah I butuh argumen, mis. IL1 / IR0");
         break;
       }
-
       String a = arg;
       a.toUpperCase();
-
       bool anyAction = false;
       for (unsigned int i = 0; i < a.length(); i++) {
         char side = a.charAt(i);
         if (side != 'L' && side != 'R') continue;
-
-        // Ambil digit setelah huruf sisi. Kalau tidak ada, anggap buka (1).
+        // Digit after the side letter; missing digit means open (1).
         char val = (i + 1 < a.length()) ? a.charAt(i + 1) : '1';
         bool open = (val == '1');
         float deg = open ? lidAngleGlobal : 0.0f;
-
         if (side == 'L') {
           addLogf("[LID] Lid KIRI -> %s (%.1f deg)",
                   open ? "BUKA" : "TUTUP", deg);
@@ -2153,53 +2494,58 @@ void executeCommand(char cmd, const String &arg) {
           lidToDeg(stLidRight, deg, stepSpeedActive);
         }
         anyAction = true;
-        i++;   // lewati digit yang sudah dipakai
+        i++;   // skip the digit already consumed
       }
-
       if (!anyAction) {
         addLogf("[WARN] Argumen I tidak valid: %s (pakai L/R)", arg.c_str());
       }
       break;
     }
 
-    // 'K' = set kecepatan stepper (step/detik). Untuk tuning anti-getar.
-    // Contoh: K300 -> 300 step/s (lambat, paling aman)
-    //         K1200 -> cepat, butuh sinyal 5V yang benar
+    // 'K' = stepper speed (step/s), independent of the wheel profile. K<sps>,
+    // e.g. K400. Unrelated to SLOW/MEDIUM/FAST, which are wheels only. Saved to flash.
     case 'K': {
       if (arg.length() > 0) {
         float sps = arg.toFloat();
+        // Floor 50: below that the stepper almost certainly stalls under the gear
+        // load, and the ramp would sit on its lower bound.
         if (sps < 50.0f)    sps = 50.0f;
         if (sps > 4000.0f)  sps = 4000.0f;
         stepSpeedActive = sps;
-        addLogf("[STEP] Kecepatan stepper = %.0f step/s", stepSpeedActive);
+        simpanProfil();
+        addLogf("[STEP] Kecepatan stepper = %.0f step/s (disimpan)", stepSpeedActive);
       }
       break;
     }
 
-    // 'D' = UJI DIR. Menggerakkan satu motor maju lalu mundur.
-    // Dipakai untuk memisahkan dua penyebab "lid selalu searah":
-    //   1) 5V untuk TB6600 mati (buck converter ikut mati)
-    //   2) kabel DIR lepas / salah pin
-    //
-    //   D   -> uji lid KIRI
-    //   DR  -> uji lid KANAN
-    //   DL  -> uji lid KIRI (sama dengan D)
+    // 'D' = DIR test: drives one motor forward then back. Separates "lid always one
+    // direction" causes: dead TB6600 5V supply (buck converter also dead), or DIR
+    // wire loose/wrong pin. D and DL left, DR right.
     case 'D': {
       String a = arg;
       a.toUpperCase();
       bool kanan = (a.indexOf('R') >= 0);
-
       if (kanan) stepperDirTest(stLidRight, "KANAN");
       else       stepperDirTest(stLidLeft,  "KIRI");
       break;
     }
 
-    // 'H' = mode TAHAN motor setelah gerakan (diagnosa "terus berputar").
-    //   H1 -> motor DIKUNCI setelah gerakan selesai
-    //   H0 -> motor DILEPAS setelah gerakan selesai (default)
-    //
-    // Kalau dengan H1 masalah "motor terus berputar" hilang, berarti
-    // penyebabnya motor free + beban, bukan sinyal DIR/PUL.
+    // 'M' = hold PUL pin at a fixed level for multimeter measurement ("motor hisses
+    // but does not move"). M/M0 idle, M1 active; MR/MR0/MR1 for the right lid.
+    // HIGH/LOW per common-anode 5V wiring. See ujiTahanPul() for the GND check.
+    case 'M': {
+      String a = arg;
+      a.toUpperCase();
+      bool kanan = (a.indexOf('R') >= 0);
+      bool aktif = (a.indexOf('1') >= 0);
+      if (kanan) ujiTahanPul(stLidRight, "KANAN", aktif);
+      else       ujiTahanPul(stLidLeft,  "KIRI",  aktif);
+      break;
+    }
+
+    // 'H' = hold motor after a move ("keeps spinning" diagnosis). H1 locks, H0
+    // releases (default). If H1 removes the symptom, the cause is a free motor
+    // under load, not DIR/PUL signals.
     case 'H': {
       bool on = (arg.length() == 0) ? true : (arg.toInt() != 0);
       holdMode = on;
@@ -2215,114 +2561,165 @@ void executeCommand(char cmd, const String &arg) {
       break;
     }
 
-    // ============================================================
-    //  'Y' = BALIK ARAH MOTOR PENGGERAK
-    // ============================================================
-    //  Dipakai kalau kabel motor terpasang terbalik, sehingga robot
-    //  bergerak berlawanan dengan tombolnya.
-    //
-    //    YL1 / YL0  -> balik / normalkan arah motor KIRI
-    //    YR1 / YR0  -> balik / normalkan arah motor KANAN
-    //
-    //  Huruf Y dipakai karena R sudah terpakai untuk pivot kanan.
-    //  Setelannya disimpan di flash, jadi tidak hilang saat dimatikan.
+    // 'Y' = reverse drive-motor direction, for motor wires fitted backwards so the
+    // robot moves opposite to its buttons. YL1/YL0 left, YR1/YR0 right. 'Y' because
+    // 'R' is taken by the right pivot; saved to flash.
     case 'Y': {
-      if (arg.length() < 2) {
-        addLog("[MOTOR] Perintah Y butuh argumen, mis. YL1 / YR0");
+      // Y2 = full diagnostic report (the "check condition" button): every number
+      // that decides whether the stepper moves, in one serial-readable block.
+      // Used by debug-stepper.cmd in this folder.
+      if (arg.length() >= 1 && (arg.charAt(0) == '2')) {
+        addLog("==================================================");
+        addLog("  LAPORAN DIAGNOSA STEPPER");
+        addLog("==================================================");
+        addLogf("[DIAG] Boot ke-%u, reset terakhir: %s",
+                (unsigned)bootCount, resetReasonName(bootResetReason));
+        addLogf("[DIAG] Brownout dicurigai: %s | Crash: %s",
+                brownoutSuspect ? "YA" : "tidak",
+                crashSuspect ? "YA" : "tidak");
+        addLog("[DIAG] --- KONFIGURASI ---");
+        addLog("[DIAG] Microstep: 1/8 (DIP SW1=OFF SW2=ON SW3=OFF)");
+        addLogf("[DIAG] %u pulsa/putaran (1 derajat = %.4f langkah)",
+                (unsigned)STEPS_PER_REV, STEPS_PER_DEG);
+        addLog("[DIAG] Arus TB6600 diasumsikan 2.0 A (SW4=ON SW5=OFF SW6=OFF)");
+        addLog("[DIAG] Kalau DIP switch berbeda dari di atas, sudut akan SALAH.");
+        addLogf("[DIAG] 1 derajat = %.4f langkah", STEPS_PER_DEG);
+        addLogf("[DIAG] Kecepatan stepper aktif = %.0f step/s", stepSpeedActive);
+        addLogf("[DIAG] Sudut global (buka) = %.1f derajat", lidAngleGlobal);
+        addLog("[DIAG] --- POLARITAS FIRMWARE ---");
+        addLogf("[DIAG] PULSE_ACTIVE = %s",
+                (PULSE_ACTIVE == LOW) ? "LOW (wiring common-anode 5V)"
+                                      : "HIGH (wiring common-cathode 3.3V)");
+        addLogf("[DIAG] PULSE_IDLE   = %s (level saat diam)",
+                (PULSE_IDLE == HIGH) ? "HIGH" : "LOW");
+        addLogf("[DIAG] DIR_FOR_POS  = %s, DIR_FOR_NEG = %s",
+                (DIR_FOR_POS == HIGH) ? "HIGH" : "LOW",
+                (DIR_FOR_NEG == HIGH) ? "HIGH" : "LOW");
+        addLogf("[DIAG] ENA_ACTIVE   = %s (motor DIKUNCI)",
+                (ENA_ACTIVE == LOW) ? "LOW" : "HIGH");
+        addLogf("[DIAG] ENA_INACTIVE = %s (motor BEBAS)",
+                (ENA_INACTIVE == LOW) ? "LOW" : "HIGH");
+        addLogf("[DIAG] Mode tahan (holdMode) = %s",
+                holdMode ? "AKTIF" : "mati");
+        addLog("[DIAG] --- PIN ---");
+        addLogf("[DIAG] Lid KIRI : PUL=GPIO%u DIR=GPIO%u ENA=GPIO%u",
+                (unsigned)LID_L_PUL, (unsigned)LID_L_DIR, (unsigned)LID_L_ENA);
+        addLogf("[DIAG] Lid KANAN: PUL=GPIO%u DIR=GPIO%u ENA=GPIO%u",
+                (unsigned)LID_R_PUL, (unsigned)LID_R_DIR, (unsigned)LID_R_ENA);
+        addLog("[DIAG] --- POSISI & MOTOR ---");
+        addLogf("[DIAG] Lid KIRI : %ld step (%.2f derajat), moving=%s",
+                stLidLeft.currentStep,
+                stLidLeft.currentStep / STEPS_PER_DEG,
+                stLidLeft.moving ? "YA" : "tidak");
+        addLogf("[DIAG] Lid KANAN: %ld step (%.2f derajat), moving=%s",
+                stLidRight.currentStep,
+                stLidRight.currentStep / STEPS_PER_DEG,
+                stLidRight.moving ? "YA" : "tidak");
+        addLogf("[DIAG] Total pulsa keluar sejak boot = %lu",
+                (unsigned long)stepTotal);
+        addLogf("[DIAG] Gerakan terakhir: %lu langkah, %.0f step/s aktual",
+                (unsigned long)gMoveLastSteps, gMoveLastSpeed);
+        addLog("[DIAG] --- KUALITAS PULSA (gerakan terakhir) ---");
+        if (gPeriodCount > 0) {
+          addLogf("[DIAG] %lu pulsa, jadwal selisih rata2=%lu us, min=%ld max=%ld",
+                  (unsigned long)gPeriodCount,
+                  (unsigned long)(gPeriodSumUs / gPeriodCount),
+                  (long)gPeriodMinUs, (long)gPeriodMaxUs);
+          addLogf("[DIAG] Pulsa macet >500us: %lu kali",
+                  (unsigned long)gLonjakCount);
+        } else {
+          addLog("[DIAG] Belum ada gerakan sejak boot - belum ada data pulsa.");
+        }
+        addLog("[DIAG] --- PRESISI ---");
+        addLogf("[DIAG] Diuji %lu kali, meleset %lu kali, selisih terbesar %ld langkah",
+                (unsigned long)gPresisiUji, (unsigned long)gPresisiGagal,
+                (long)gPresisiMaksSelisih);
+        addLog("[DIAG] --- ARAH ---");
+        addLogf("[DIAG] Pernah diperintah BUKA : %s", gMovedUp   ? "YA" : "belum");
+        addLogf("[DIAG] Pernah diperintah TUTUP: %s", gMovedDown ? "YA" : "belum");
+        addLog("[DIAG] --- KESIMPULAN OTOMATIS ---");
+        if (gPeriodCount > 0 && gPeriodMaxUs <= 50) {
+          addLog("[DIAG] Pulsa dari ESP32 RAPI (jitter <= 50us).");
+          addLog("[DIAG] Kalau motor tetap diam/mendesis, penyebabnya DI LUAR");
+          addLog("[DIAG] ESP32: tegangan catu TB6600, arus DIP, atau kabel.");
+          addLog("[DIAG] TB6600 butuh 19-40VDC. Di bawah 19V motor bisa");
+          addLog("[DIAG] hanya mendesis tanpa berputar.");
+        } else if (gPeriodCount == 0) {
+          addLog("[DIAG] Belum ada gerakan diuji. Jalankan 'E' dulu.");
+        } else {
+          addLogf("[DIAG] Pulsa TIDAK rapi (jitter maks %lu us).",
+                  (unsigned long)gPeriodMaxUs);
+          addLog("[DIAG] Ini masalah di sisi ESP32/task - laporkan ke pengembang.");
+        }
+        addLog("==================================================");
         break;
       }
 
+      if (arg.length() < 2) {
+        addLog("[MOTOR] Perintah Y butuh argumen, mis. YL1 / YR0 / Y2");
+        break;
+      }
       String a = arg;
       a.toUpperCase();
-
       char sisi = a.charAt(0);
       if (sisi != 'L' && sisi != 'R') {
         addLogf("[WARN] Sisi harus L atau R - bukan %c", sisi);
         break;
       }
-
       bool balik = (a.charAt(1) != '0');
-
       if (sisi == 'L') motorBalikKiri  = balik;
       else             motorBalikKanan = balik;
-
       simpanArahMotor();
-
       addLogf("[MOTOR] Arah motor %s = %s (tersimpan)",
               (sisi == 'L' ? "KIRI" : "KANAN"),
               balik ? "DIBALIK" : "normal");
-
-      // Terapkan segera supaya kalau roda sedang jalan, arahnya
-      // langsung berubah tanpa perlu berhenti dulu.
+      // Applied at once so a moving wheel changes direction without stopping.
       if (moveMode != MOVE_STOP) motorApply();
       break;
     }
 
-    // ============================================================
-    //  'Z' = KOMPENSASI RODA DAN TAMBAHAN TENAGA SAAT BELOK
-    // ============================================================
-    //  Dipakai kalau saat maju robot tidak lurus, atau saat berputar
-    //  di tempat salah satu roda terlihat lebih lambat.
-    //
-    //    ZL<n>  -> kompensasi roda KIRI,  -60 sampai +60
-    //    ZR<n>  -> kompensasi roda KANAN, -60 sampai +60
-    //    ZB<n>  -> tambahan PWM saat belok, 0 sampai 90
-    //
-    //  Contoh: ZL15 berarti roda kiri diberi PWM 15 lebih tinggi
-    //  daripada nilai dasar. Naikkan angka untuk roda yang lemah,
-    //  jangan turunkan roda yang kuat.
-    //
-    //  Semua nilai disimpan di flash.
+    // 'Z' = wheel compensation and extra power when turning, for drifting when
+    // going straight or a slower wheel when pivoting. ZL<n>/ZR<n> compensation
+    // -60..+60, ZB<n> extra turning PWM 0..90. e.g. ZL15 gives the left wheel PWM
+    // 15 above base: raise the weak wheel, never lower the strong one. Saved to flash.
     case 'Z': {
       String a = arg;
       a.toUpperCase();
-
       if (a.length() < 2) {
         addLog("[MOTOR] Format: ZL<n>, ZR<n>, atau ZB<n>");
         break;
       }
-
       char apa = a.charAt(0);
       int  v   = a.substring(1).toInt();
-
       if (apa == 'L' || apa == 'R') {
         if (v < -KOMPENSASI_MAKS) v = -KOMPENSASI_MAKS;
         if (v >  KOMPENSASI_MAKS) v =  KOMPENSASI_MAKS;
-
         if (apa == 'L') pwmKompensasiKiri  = (int8_t)v;
         else            pwmKompensasiKanan = (int8_t)v;
-
         simpanMotor();
         addLogf("[MOTOR] Kompensasi roda %s = %+d",
                 (apa == 'L' ? "KIRI" : "KANAN"), v);
-
       } else if (apa == 'B') {
         if (v < 0) v = 0;
         if (v > TAMBAHAN_BELOK_MAKS) v = TAMBAHAN_BELOK_MAKS;
-
         tambahanBelok = (uint8_t)v;
         simpanMotor();
         addLogf("[MOTOR] Tambahan PWM saat belok = +%d", v);
-
       } else {
         addLog("[MOTOR] Format: ZL<n>, ZR<n>, atau ZB<n>");
         break;
       }
-
-      // Terapkan segera supaya perubahan bisa langsung dirasakan.
+      // Applied at once so the change is felt immediately.
       if (moveMode != MOVE_STOP) motorApply();
       break;
     }
 
-    // 'X' = saklar uji untuk mencari penyebab perioda pulsa panjang.
-    //   XB1 -> matikan BLE (uji: apakah BLE/flash yang menahan pulsa)
-    //   XB0 -> hidupkan BLE
-    //   XT1 -> tick hanya motor yang aktif (uji: beban spin loop)
-    //   XT0 -> tick keduanya
+    // 'X' = test switches for hunting long pulse periods. XB1 BLE off (is
+    // BLE/flash holding pulses?), XB0 on; XT1 tick only the active motor (spin
+    // loop load), XT0 both.
     case 'X': {
       String a = arg;
       a.toUpperCase();
-
       if (a.startsWith("B")) {
         bleOff = (a.length() > 1 && a.charAt(1) == '1');
         if (bleOff) BLEAdvertising_stop();
@@ -2341,37 +2738,25 @@ void executeCommand(char cmd, const String &arg) {
       break;
     }
 
-    // ============================================================
-    //  'G' = ATUR SUDUT SATU LID  (untuk kontrol halus / tuning)
-    // ============================================================
-    //  Format:  G<L|R><sudut>      sudut dalam DERAJAT
-    //  Contoh:  GL10   -> lid KIRI ke 10 derajat
-    //           GL12.5 -> lid KIRI ke 12.5 derajat
-    //           GR0    -> lid KANAN ke 0 derajat
-    //
-    //  Arah ditentukan OTOMATIS dari selisih posisi (seperti biasa).
-    //  Pergerakan dibatasi supaya tidak menabrak mekanik.
+    // 'G' = set one lid angle (fine control/tuning). G<L|R><angle> in DEGREES,
+    // e.g. GL10, GL12.5, GR0. Direction comes from the position difference;
+    // motion is clamped so it cannot hit the mechanics.
     case 'G': {
       if (arg.length() < 2) {
         addLog("[LID] Perintah G butuh argumen, mis. GL10");
         break;
       }
-
       String a = arg;
       a.toUpperCase();
-
       char sisi = a.charAt(0);
       if (sisi != 'L' && sisi != 'R') {
         addLogf("[WARN] Sisi harus L atau R, bukan %c", sisi);
         break;
       }
-
       float deg = a.substring(1).toFloat();
-
-      // Batas aman: 0 sampai LID_MAX_DEG
+      // Safe range: 0 to LID_MAX_DEG
       if (deg < 0.0f)         deg = 0.0f;
       if (deg > LID_MAX_DEG)  deg = LID_MAX_DEG;
-
       if (sisi == 'L') {
         addLogf("[LID] Lid KIRI -> %.2f derajat", deg);
         lidToDeg(stLidLeft, deg, stepSpeedActive);
@@ -2382,86 +2767,57 @@ void executeCommand(char cmd, const String &arg) {
       break;
     }
 
-    // ============================================================
-    //  'O' = BUKA / TUTUP  (memakai sudut global)
-    // ============================================================
-    //  Format:  O<L|R|B><1|0>
-    //    1 = BUKA  sampai sudut global (CW)
-    //    0 = TUTUP sampai 0 derajat (CCW)
-    //
-    //  Contoh:  OL1 -> lid KIRI buka sampai sudut global
-    //           OL0 -> lid KIRI tutup sampai 0 derajat
-    //           OB1 -> KEDUA lid buka
-    //           OB0 -> KEDUA lid tutup
-    //
-    //  PENTING - kenapa dulu ada bug "tutup malah bergerak":
-    //  perintah lama memakai GESER RELATIF (tambah/kurang sekian derajat),
-    //  sehingga menekan TUTUP saat sudah tertutup malah mengurangi sudut
-    //  lagi dan motor tetap bergerak. Sekarang perintah ini menuju SUDUT
-    //  TETAP: kalau sudah di posisi tujuan, motor tidak bergerak sama
-    //  sekali.
+    // 'O' = open/close using the global angle. O<L|R|B><1|0>, 1 = open to global
+    // angle (CW), 0 = close to 0 deg (CCW), e.g. OL1, OL0, OB1, OB0.
+    // Why the old "close, but it still moves" bug happened: the old command used
+    // RELATIVE offsets, so pressing CLOSE while closed kept subtracting and the
+    // motor kept moving. This targets a FIXED angle: already there means no movement.
     case 'O': {
       if (arg.length() < 2) {
         addLog("[LID] Perintah O butuh argumen, mis. OL1");
         break;
       }
-
       String a = arg;
       a.toUpperCase();
-
       char sisi = a.charAt(0);
       if (sisi != 'L' && sisi != 'R' && sisi != 'B') {
         addLogf("[WARN] Sisi harus L, R, atau B - bukan %c", sisi);
         break;
       }
-
       bool buka = (a.charAt(1) != '0');
       float degTujuan = buka ? lidAngleGlobal : 0.0f;
-
       Stepper *daftar[2];
       int jumlah = 0;
       if (sisi == 'L' || sisi == 'B') daftar[jumlah++] = &stLidLeft;
       if (sisi == 'R' || sisi == 'B') daftar[jumlah++] = &stLidRight;
-
       for (int i = 0; i < jumlah; i++) {
         long targetBaru = lroundf(degTujuan * STEPS_PER_DEG);
-
-        // Kalau sudah di posisi tujuan, jangan bergerak sama sekali.
-        // Ini yang mencegah "sudah tutup tapi masih bergerak".
+        // Already at target means no movement at all, which is what prevents
+        // "already closed but still moving".
         if (daftar[i]->currentStep == targetBaru && !daftar[i]->moving) {
           addLogf("[LID] %s sudah di %.1f derajat - tidak bergerak",
                   (daftar[i] == &stLidLeft ? "KIRI" : "KANAN"), degTujuan);
           continue;
         }
-
         addLogf("[LID] %s %s ke %.1f derajat",
                 (daftar[i] == &stLidLeft ? "KIRI" : "KANAN"),
                 (buka ? "BUKA" : "TUTUP"), degTujuan);
-
         lidToDeg(*daftar[i], degTujuan, stepSpeedActive);
       }
       break;
     }
 
-    // ============================================================
-    //  'W' = ATUR SUDUT GLOBAL  (dipakai semua perintah buka/tutup)
-    // ============================================================
-    //  Format:  W<sudut>      dalam derajat
-    //  Contoh:  W10  -> mulai sekarang, BUKA berarti 10 derajat
-    //           W45  -> BUKA berarti 45 derajat
-    //
-    //  Nilai ini disimpan ke memori flash, jadi tetap tersimpan
-    //  setelah ESP32 dimatikan.
+    // 'W' = set global angle used by every open/close command. W<angle> in
+    // degrees: W10 makes BUKA mean 10 deg, W45 means 45 deg. Saved to flash,
+    // but only once the lids stop -- see flushKotor().
     case 'W': {
       float d = arg.toFloat();
-
       if (d < LID_ANGLE_MIN) d = LID_ANGLE_MIN;
       if (d > LID_ANGLE_MAX) d = LID_ANGLE_MAX;
-
       lidAngleGlobal = d;
-      simpanSudutGlobal();
-
-      addLogf("[SUDUT] Sudut global = %.1f derajat (tersimpan)", lidAngleGlobal);
+      gSudutKotor    = true;
+      addLogf("[SUDUT] Sudut global = %.1f derajat (akan disimpan setelah gerakan berhenti)",
+              lidAngleGlobal);
       break;
     }
 
@@ -2482,7 +2838,6 @@ void executeCommand(char cmd, const String &arg) {
 }
 
 // ==================== WEB HANDLER ====================
-
 void handleRoot() {
   server.send_P(200, "text/html", INDEX_HTML);
 }
@@ -2497,11 +2852,9 @@ void handleCmd() {
     server.send(400, "text/plain", "Bad Request");
     return;
   }
-
   char cmd = val.charAt(0);
   String arg = val.substring(1);
   addLogf("[WEB] Terima: %c (arg=%s)", cmd, arg.c_str());
-
   executeCommand(cmd, arg);
   server.send(200, "text/plain", "OK");
 }
@@ -2541,21 +2894,12 @@ void handleNotFound() {
   server.send(404, "text/plain", "Not found");
 }
 
-// ==================== HALAMAN /debug ====================
-//
-//  Halaman diagnostik yang bisa dibuka dari HP tanpa laptop:
-//      http://192.168.4.1/debug
-//
-//  Menampilkan:
-//   - Statistik jitter stepper (max, rata-rata, jumlah pulsa terlambat)
-//   - Posisi & kecepatan tiap lid
-//   - Status WiFi, memori, uptime
-//   - 40 pesan log terakhir
-//   - Tombol tes cepat (buka/tutup tiap lid, sweep kecepatan)
-
+// ==================== /debug PAGE ====================
+// Laptop-free diagnostic page at http://192.168.4.1/debug: stepper jitter stats
+// (max, average, late pulses), per-lid position and speed, WiFi/memory/uptime,
+// the last 40 log lines, and quick test buttons (open/close each lid, sweep).
 void handleDebugJson() {
   float jitAvg = (jitCount > 0) ? ((float)jitSumUs / (float)jitCount) : 0.0f;
-
   char buf[700];
   snprintf(buf, sizeof(buf),
     "{"
@@ -2564,13 +2908,13 @@ void handleDebugJson() {
       "\"minHeap\":%lu,"
       "\"wifiClients\":%d,"
       "\"rssi\":%d,"
-      // --- stepper kiri ---
+      // --- left stepper ---
       "\"ll\":%.2f,"
       "\"llTarget\":%.2f,"
       "\"llMoving\":%d,"
       "\"llSpeed\":%.0f,"
       "\"llEnabled\":%d,"
-      // --- stepper kanan ---
+      // --- right stepper ---
       "\"lr\":%.2f,"
       "\"lrTarget\":%.2f,"
       "\"lrMoving\":%d,"
@@ -2582,19 +2926,19 @@ void handleDebugJson() {
       "\"jitSamples\":%lu,"
       "\"jitLate\":%lu,"
       "\"stepTotal\":%lu,"
-      // --- konfigurasi ---
+      // --- config ---
       "\"stepSpeed\":%.0f,"
       "\"rampSteps\":%ld,"
       "\"pulseMinUs\":%lu,"
       "\"pwm\":%d,"
       "\"move\":\"%s\","
       "\"lopen\":%.1f,"
-      // --- instrumentasi task (untuk diagnosa lanjutan) ---
+      // --- task instrumentation (deeper diagnosis) ---
       "\"spinLoops\":%lu,"
       "\"spinMaxUs\":%lu,"
       "\"delayLateMaxUs\":%lu,"
       "\"core\":%d,"
-      // --- pelacak reset / brownout ---
+      // --- reset / brownout tracking ---
       "\"bootCount\":%lu,"
       "\"resetReason\":%lu,"
       "\"resetName\":\"%s\","
@@ -2633,32 +2977,27 @@ void handleDebugJson() {
     (unsigned long)ESP.getMinFreeHeap(),
     (int)WiFi.softAPgetStationNum(),
     (int)WiFi.RSSI(),
-
     stLidLeft.currentStep  / STEPS_PER_DEG,
     stLidLeft.targetStep   / STEPS_PER_DEG,
     stLidLeft.moving ? 1 : 0,
     stLidLeft.speedCurrent,
     stLidLeft.enabled ? 1 : 0,
-
     stLidRight.currentStep / STEPS_PER_DEG,
     stLidRight.targetStep  / STEPS_PER_DEG,
     stLidRight.moving ? 1 : 0,
     stLidRight.speedCurrent,
     stLidRight.enabled ? 1 : 0,
-
     (unsigned long)jitMaxUs,
     jitAvg,
     (unsigned long)jitCount,
     (unsigned long)jitLateCnt,
     (unsigned long)stepTotal,
-
     stepSpeedActive,
     (long)RAMP_MIN_STEPS,
     (unsigned long)PULSE_MIN_US,
     (int)speedPWM,
     (moveMode == MOVE_STOP) ? "stop" : "run",
     lidAngleGlobal,
-
     (unsigned long)spinLoopCnt,
     (unsigned long)spinMaxUs,
     (unsigned long)delayLateMax,
@@ -2695,33 +3034,22 @@ void handleDebugJson() {
     (unsigned)sweepTotalMeleset,
     (int)(sweepKecepatanAman * 10.0f),
     STEPS_PER_DEG);
-
   server.send(200, "application/json", buf);
 }
 
-// ============================================================
-//  LAPORAN DIAGNOSA LENGKAP  (untuk diunduh dan dikirim)
-// ============================================================
-//
-//  Membangun satu file teks yang memuat SEMUA yang dibutuhkan untuk
-//  menganalisis masalah dari jarak jauh:
-//    - status lengkap dalam bentuk yang mudah dibaca
-//    - penilaian otomatis (mana yang OK, mana yang bermasalah)
-//    - riwayat log
-//    - riwayat diagnosa yang pernah muncul
-//
-//  Dipakai oleh /debug/download (file) dan bisa juga dibaca di web.
+// ==================== FULL DIAGNOSTIC REPORT (for download and sending on) ====================
+// Builds one text file with everything needed to analyse a problem remotely:
+// readable full status, automatic verdict on what is OK and what is wrong, the
+// log history, and past diagnoses. Used by /debug/download (as a file) and
+// readable in the web UI.
 String buildLaporan() {
   String o;
   o.reserve(6000);
-
   unsigned long up = millis() / 1000UL;
-
   o += "==================================================\n";
   o += "LAPORAN DIAGNOSA SMART TRASHBIN\n";
   o += "==================================================\n\n";
-
-  // ---------- RINGKASAN ----------
+  // ---------- SUMMARY ----------
   o += "--- RINGKASAN ---\n";
   o += "Uptime            : " + String(up) + " detik\n";
   o += "Boot ke-          : " + String(bootCount) + "\n";
@@ -2733,7 +3061,6 @@ String buildLaporan() {
        String((PULSE_ACTIVE == LOW) ? "common-anode 5V (aktif-LOW)"
                                     : "common-cathode 3.3V (aktif-HIGH)") + "\n";
   o += "\n";
-
   // ---------- STEPPER ----------
   o += "--- STEPPER / LID ---\n";
   o += "Lid KIRI  posisi  : " + String(stLidLeft.currentStep / STEPS_PER_DEG, 1) +
@@ -2754,8 +3081,7 @@ String buildLaporan() {
   o += "Pernah TUTUP      : " + String(gMovedDown ? "ya" : "belum") + "\n";
   o += "Total pulsa keluar: " + String(stepTotal) + "\n";
   o += "\n";
-
-  // ---------- KECEPATAN AKTUAL (deteksi kehilangan langkah) ----------
+  // ---------- ACTUAL SPEED (step-loss detection) ----------
   o += "--- GERAKAN TERAKHIR DIUKUR ---\n";
   o += "Jumlah gerakan    : " + String(gMoveCount) + "\n";
   if (gMoveStartUs && gMoveEndUs > gMoveStartUs) {
@@ -2764,7 +3090,6 @@ String buildLaporan() {
     o += "Pulsa gerakan itu : " + String(gMoveLastSteps) + "\n";
     o += "Kecepatan AKTUAL  : " + String(gMoveLastSpeed, 0) + " step/s\n";
     o += "Kecepatan DIMINTA : " + String(stepSpeedActive, 0) + " step/s\n";
-
     float rasio = (stepSpeedActive > 0)
                 ? (gMoveLastSpeed / stepSpeedActive * 100.0f) : 0.0f;
     o += "Rasio             : " + String(rasio, 0) + "% dari target\n";
@@ -2786,14 +3111,12 @@ String buildLaporan() {
     o += "(belum ada gerakan yang diukur)\n";
   }
   o += "\n";
-
-  // ---------- PRESISI / KONSISTENSI ----------
+  // ---------- PRECISION / CONSISTENCY ----------
   o += "--- PRESISI / KONSISTENSI ---\n";
   o += "Gerakan diuji     : " + String(gPresisiUji) + "\n";
   o += "Meleset           : " + String(gPresisiGagal) + "\n";
   o += "Selisih terbesar  : " + String(gPresisiMaksSelisih) + " langkah ("
        + String(gPresisiMaksSelisih / STEPS_PER_DEG, 3) + " derajat)\n";
-
   if (gPresisiUji == 0) {
     o += "[?] Belum ada gerakan yang diuji.\n";
   } else if (gPresisiGagal == 0) {
@@ -2813,7 +3136,6 @@ String buildLaporan() {
     o += "    Coba turunkan kecepatan (K600) lalu uji ulang.\n";
   }
   o += "\n";
-
   // ---------- JITTER ----------
   o += "--- JITTER (ketepatan waktu pulsa) ---\n";
   float avg = (jitCount > 0) ? ((float)jitSumUs / (float)jitCount) : 0.0f;
@@ -2821,15 +3143,13 @@ String buildLaporan() {
   o += "Jitter rata-rata  : " + String(avg, 2) + " us\n";
   o += "Pulsa terlambat   : " + String(jitLateCnt) + " dari " + String(jitCount) + "\n";
   o += "\n";
-
-  // ---------- GERAKAN TERAKHIR ----------
+  // ---------- LAST MOVEMENT ----------
   o += "--- GERAKAN TERAKHIR ---\n";
   o += "Mode roda         : " + String((int)moveMode) + "\n";
   o += "PWM roda          : " + String(speedPWM) + "\n";
   o += "Kanan CMD terakhir: " + String(millis() - lastCmdMillis) + " ms lalu\n";
   o += "\n";
-
-  // ---------- SISTEM ----------
+  // ---------- SYSTEM ----------
   o += "--- SISTEM ---\n";
   o += "RAM bebas         : " + String(ESP.getFreeHeap()) + " byte\n";
   o += "RAM minimum       : " + String(ESP.getMinFreeHeap()) + " byte\n";
@@ -2837,12 +3157,9 @@ String buildLaporan() {
   o += "Task stepper core : " + String(STEPPER_CORE) + "\n";
   o += "Log total / drop  : " + String(logTotal) + " / " + String(logDrop) + "\n";
   o += "\n";
-
-
-// ---------- PENILAIAN OTOMATIS ----------
+  // ---------- AUTOMATIC VERDICT ----------
   o += "--- PENILAIAN OTOMATIS ---\n";
   uint8_t nMasalah = 0;
-
   if (jitCount == 0) {
     o += "[?] Belum ada data jitter (belum ada gerakan).\n";
   } else if (jitMaxUs < 50) {
@@ -2852,7 +3169,6 @@ String buildLaporan() {
   } else {
     o += "[X] Jitter maksimum " + String(jitMaxUs) + " us - BURUK.\n"; nMasalah++;
   }
-
   if (jitCount > 0) {
     float rate = (100.0f * (float)jitLateCnt) / (float)jitCount;
     if (rate < 0.5f) {
@@ -2863,7 +3179,6 @@ String buildLaporan() {
       o += "[X] Pulsa terlambat " + String(rate, 2) + "% - TINGGI.\n"; nMasalah++;
     }
   }
-
   if (brownoutSuspect) { o += "[X] Brownout - tegangan turun saat motor jalan.\n"; nMasalah++; }
   if (crashSuspect)    { o += "[X] Crash/watchdog terdeteksi.\n"; nMasalah++; }
   if (moveInterrupted) { o += "[X] Gerakan terputus oleh reset.\n"; nMasalah++; }
@@ -2885,15 +3200,12 @@ String buildLaporan() {
     o += "    dan naik lagi setelah itu. Yang menentukan adalah RAM\n";
     o += "    MINIMUM dan apakah RAM sekarang sudah pulih.\n";
   }
-
-  // Yang benar-benar penting: seberapa rendah RAM pernah turun, dan
-  // apakah setelah itu pulih. RAM yang rendah SESUAT bukan masalah
-  // selama tidak sampai kehabisan dan bisa pulih kembali.
+  // What really matters: how low RAM ever went and whether it recovered. A
+  // momentary low reading is fine as long as it did not run out and recovers.
   uint32_t heapNow = ESP.getFreeHeap();
   uint32_t heapMin = ESP.getMinFreeHeap();
   o += "[INFO] RAM sekarang " + String(heapNow) +
        " byte, minimum pernah " + String(heapMin) + " byte.\n";
-
   if (heapMin < 8000) {
     o += "[X] RAM minimum pernah di bawah 8 KB - berisiko gagal alokasi.\n";
     nMasalah++;
@@ -2902,12 +3214,10 @@ String buildLaporan() {
   } else {
     o += "[OK] RAM minimum masih aman (di atas 16 KB).\n";
   }
-
   if (heapNow < 8000) {
     o += "[X] RAM SEKARANG di bawah 8 KB - sistem bisa macet.\n";
     nMasalah++;
   }
-
   o += "\n";
   if (nMasalah == 0) {
     o += "KESIMPULAN: TIDAK ADA MASALAH TERDETEKSI di firmware.\n";
@@ -2922,12 +3232,10 @@ String buildLaporan() {
   o += "driver, BUKAN dari sensor. Motor yang kehilangan langkah tetap\n";
   o += "terbaca 90 derajat walau lid belum sampai.\n";
   o += "\n";
-
   // ---------- LOG ----------
   o += "==================================================\n";
   o += "LOG (" + String(LOG_LINES) + " baris terakhir)\n";
   o += "==================================================\n";
-
   uint16_t start = (logTotal < LOG_LINES) ? 0 : logHead;
   uint16_t count = (logTotal < LOG_LINES) ? logTotal : LOG_LINES;
   for (uint16_t i = 0; i < count; i++) {
@@ -2936,45 +3244,37 @@ String buildLaporan() {
     o += logRing[idx];
     o += "\n";
   }
-
   return o;
 }
 
-// Unduh laporan lengkap sebagai FILE .txt
-// Header Content-Disposition membuat browser MENYIMPANNYA sebagai file,
-// sehingga bisa langsung dikirim ke pengembang.
+// Download the full report as a .txt FILE. The Content-Disposition header makes
+// the browser SAVE it as a file so it can be sent straight to a dev.
 void handleDebugDownload() {
   String lap = buildLaporan();
-
   char nama[64];
   snprintf(nama, sizeof(nama),
            "attachment; filename=\"trashbin-%lus-boot%lu.txt\"",
            millis() / 1000UL, (unsigned long)bootCount);
-
   server.sendHeader("Content-Disposition", nama);
   server.send(200, "text/plain; charset=utf-8", lap);
 }
 
 void handleDebugLog() {
-  // Kirim pesan log dari yang paling lama ke paling baru
+  // Send log messages oldest first
   String out;
   out.reserve(LOG_LINES * (LOG_LEN + 8));
-
   uint16_t start = (logTotal < LOG_LINES) ? 0 : logHead;
   uint16_t count = (logTotal < LOG_LINES) ? logTotal : LOG_LINES;
-
   for (uint16_t i = 0; i < count; i++) {
     uint16_t idx = (start + i) % LOG_LINES;
     if (logRing[idx][0] == 0) continue;
     out += logRing[idx];
     out += "\n";
   }
-
   char hdr[80];
   snprintf(hdr, sizeof(hdr), "# total=%u drop=%lu\n",
            (unsigned)logTotal, (unsigned long)logDrop);
   out = String(hdr) + out;
-
   server.send(200, "text/plain; charset=utf-8", out);
 }
 
@@ -2988,1196 +3288,7 @@ void handleDebugReset() {
   server.send(200, "text/plain", "OK statistik direset");
 }
 
-// Halaman HTML untuk /debug — dibuat ringkas, muat di layar HP.
-const char DEBUG_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
-<html lang="id"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Debug · SmartTrashbin</title>
-<style>
-:root{--bg:#0c1015;--pan:#141a22;--fg:#e6edf3;--dim:#8b98a8;--acc:#4ea8ff;
---ok:#3fb950;--warn:#d29922;--er:#f85149;--bd:#232c38}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);
-font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;padding:12px}
-h1{font-size:15px;margin:0 0 12px;letter-spacing:.5px}
-h1 span{color:var(--acc)}
-.card{background:var(--pan);border:1px solid var(--bd);border-radius:9px;
-padding:11px;margin-bottom:10px}
-.card h2{font-size:11px;margin:0 0 9px;color:var(--dim);
-text-transform:uppercase;letter-spacing:1px;font-weight:600}
-.row{display:flex;justify-content:space-between;padding:3px 0;
-border-bottom:1px solid #1b232d;font-size:13px}
-.row:last-child{border:0}
-.row b{font-weight:600}
-.k{color:var(--dim)}
-.ok{color:var(--ok)}.warn{color:var(--warn)}.er{color:var(--er)}.dimc{color:var(--dim)}
-button.aktif{background:#2d4a6b;border-color:#4a7ab5;color:#cfe3ff;font-weight:700}
-button.okBtn{border-color:#2f5e3a;color:#9ce8b0}
-button.warnBtn{border-color:#5a4218;color:#ffd479}
-.btns{display:flex;flex-wrap:wrap;gap:6px}
-button{flex:1 1 46%;padding:9px 6px;font:inherit;font-size:12px;
-background:#1e2833;color:var(--fg);border:1px solid var(--bd);
-border-radius:7px;cursor:pointer}
-button:active{background:var(--acc);color:#04121f}
-button.warnBtn{border-color:#5a4218}
-pre{background:#0a0e13;border:1px solid var(--bd);border-radius:7px;
-padding:9px;font-size:11px;line-height:1.45;max-height:46vh;
-overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0}
-.bar{height:5px;background:#1b232d;border-radius:3px;overflow:hidden;margin-top:5px}
-.bar i{display:block;height:100%;background:var(--ok);transition:width .3s}
-</style></head><body>
-
-<h1>DEBUG <span>SmartTrashbin</span></h1>
-
-<div class="card"><h2>Stepper · Lid</h2>
-  <div class="row"><span class="k">KIRI pos / target</span>
-    <b><span id="ll">-</span>° / <span id="llt">-</span>°</b></div>
-  <div class="row"><span class="k">KIRI kecepatan</span><b id="lls">-</b></div>
-  <div class="row"><span class="k">KANAN pos / target</span>
-    <b><span id="lr">-</span>° / <span id="lrt">-</span>°</b></div>
-  <div class="row"><span class="k">KANAN kecepatan</span><b id="lrs">-</b></div>
-</div>
-
-<div class="card"><h2>Jitter Monitor</h2>
-  <div class="row"><span class="k">Jitter maksimum</span>
-    <b id="jitmax">-</b></div>
-  <div class="row"><span class="k">Jitter rata-rata</span>
-    <b id="jitavg">-</b></div>
-  <div class="row"><span class="k">Pulsa terlambat &gt;50µs</span>
-    <b id="jitlate">-</b></div>
-  <div class="row"><span class="k">Total pulsa keluar</span>
-    <b id="steps">-</b></div>
-  <div class="bar"><i id="jitbar" style="width:0%"></i></div>
-  <p style="font-size:11px;color:var(--dim);margin:8px 0 0">
-  Jitter = keterlambatan pulsa dari jadwalnya. <b>&lt;50µs</b> halus.
-  <b>50–200µs</b> agak kasar. <b>&gt;200µs</b> tersentak.</p>
-</div>
-
-<div class="card"><h2>Presisi Gerakan</h2>
-  <div class="row"><span class="k">Gerakan diuji</span>
-    <b id="preUji">-</b></div>
-  <div class="row"><span class="k">Meleset</span>
-    <b id="preGagal">-</b></div>
-  <div class="row"><span class="k">Selisih terbesar</span>
-    <b id="preMaks">-</b></div>
-  <div class="row"><span class="k">Akurasi</span>
-    <b id="preAkurasi">-</b></div>
-  <div class="bar"><i id="preBar" style="width:0%"></i></div>
-  <p style="font-size:11px;color:var(--dim);margin:8px 0 0">
-  Menghitung berapa kali titik berhenti lid meleset dari target.
-  <b>0 meleset</b> berarti gerakan konsisten. Kalau meleset, lid
-  kehilangan langkah dari arus kurang atau beban berat.</p>
-</div>
-
-<div class="card"><h2>Diagnosa Otomatis</h2>
-  <div id="diagnosa" style="font-size:12.5px">memeriksa…</div>
-</div>
-
-<div class="card"><h2>Sistem</h2>  <div class="row"><span class="k">Uptime</span><b id="up">-</b></div>
-  <div class="row"><span class="k">RAM bebas / minimum</span><b id="heap">-</b></div>
-  <div class="row"><span class="k">Klien WiFi tersambung</span><b id="cli">-</b></div>
-  <div class="row"><span class="k">Kecepatan stepper aktif</span><b id="ss">-</b></div>
-  <div class="row"><span class="k">Kecepatan roda (PWM)</span><b id="pwm">-</b></div>
-  <div class="row"><span class="k">Status gerak</span><b id="mv">-</b></div>
-  <div class="row"><span class="k">Boot ke-</span><b id="bc">-</b></div>
-  <div class="row"><span class="k">Alasan reset terakhir</span><b id="rr">-</b></div>
-  <div class="row"><span class="k">Polaritas sinyal</span><b id="pol">-</b></div>
-  <div class="row"><span class="k">Arah pernah diperintahkan</span><b id="dirs">-</b></div>
-</div>
-
-<div class="card"><h2>Uji DIR &amp; Daya</h2>
-  <p style="font-size:12px;margin:0 0 8px">
-  Kalau buka &amp; tutup selalu searah, tekan <b>UJI DIR KIRI</b> lalu
-  <b>perhatikan lid</b>. Motor akan digerakkan maju lalu mundur.</p>
-  <div class="row"><span class="k">Lib bergoyang bolak-balik</span>
-    <b class="ok">DIR bekerja &rarr; cek 5V buck</b></div>
-  <div class="row"><span class="k">Lid jalan terus satu arah</span>
-    <b class="er">DIR tidak sampai ke TB6600</b></div>
-  <div class="row"><span class="k">Mode tahan motor</span><b id="hold">-</b></div>
-  <p style="font-size:11.5px;color:var(--dim);margin:8px 0 0">
-  <b>Kalau motor jalan TERUS walau sudah berhenti (posisi di atas sudah
-  diam tapi poros masih berputar):</b> tekan <b>TAHAN Motor ON</b> lalu
-  uji ulang. Kalau berhenti, penyebabnya motor <i>free</i> + beban
-  (gravitasi), bukan sinyal. Kalau masih jalan, berarti ada pulsa palsu
-  dari noise di kabel PUL.</p>
-  <p style="font-size:11.5px;color:var(--dim);margin:8px 0 0">
-  <b>PENTING soal daya:</b> kalau ESP32 diberi daya dari laptop dan
-  baterai motor dimatikan, buck converter 5V juga mati &mdash;
-  sehingga TB6600 <b>tidak dapat sinyal DIR</b>. Uji dulu dengan daya
-  lengkap (baterai + buck hidup) sebelum menyimpulkan wiring-nya salah.</p>
-</div>
-
-<div class="card"><h2>Motor Penggerak</h2>
-  <p style="font-size:11.5px;color:var(--dim);margin:0 0 10px">
-  Untuk mengubah setelan robot, buka <b><a href="/setting"
-  target="_blank" rel="noopener" style="color:var(--acc)">halaman Setelan</a></b>.
-  Halaman ini untuk diagnosa, bukan untuk mengatur.</p>
-  <div class="row"><span class="k">Status roda</span>
-    <b id="mStatus">-</b></div>
-  <div class="row"><span class="k">PWM</span>
-    <b id="mPwm">-</b></div>
-  <div class="row"><span class="k">Pengaman berhenti</span>
-    <b id="mTimeout">-</b></div>
-
-  <div class="row"><span class="k">Uji gerak</span>
-    <span>
-      <button onmousedown="maju()" onmouseup="mStop()" ontouchstart="maju()" ontouchend="mStop()">MAJU</button>
-      <button onmousedown="mback()" onmouseup="mStop()" ontouchstart="mback()" ontouchend="mStop()">MUNDUR</button>
-      <button onclick="c('P')">STOP</button>
-    </span>
-  </div>
-
-  <div class="row"><span class="k">Arah motor KIRI</span>
-    <span><b id="mBalikL">-</b>
-      <button onclick="c('YL1')">Balik</button>
-      <button onclick="c('YL0')">Normal</button></span>
-  </div>
-
-  <div class="row"><span class="k">Arah motor KANAN</span>
-    <span><b id="mBalikR">-</b>
-      <button onclick="c('YR1')">Balik</button>
-      <button onclick="c('YR0')">Normal</button></span>
-  </div>
-
-  <p style="font-size:11px;color:var(--dim);margin:10px 0 0">
-  Tekan <b>MAJU</b> dan lihat roda. Kalau roda berputar ke belakang,
-  tekan <b>Balik</b> pada sisi itu. Setelah benar, tekan <b>MAJU</b>
-  lagi untuk memastikan. Setelan ini tersimpan di memori.</p>
-</div>
-
-<div class="card"><h2>Uji Torsi &amp; Kecepatan Maksimal</h2>
-  <p style="font-size:11.5px;color:var(--dim);margin:0 0 10px">
-  Mencari pada kecepatan berapa motor mulai kehilangan langkah.
-  Motor akan bergerak bolak-balik sekitar 30 detik.</p>
-
-  <div class="row"><span class="k">Jalankan uji</span>
-    <span>
-      <button onclick="c('QL')">LID KIRI</button>
-      <button onclick="c('QR')">LID KANAN</button>
-      <button onclick="c('QB')">KEDUA</button>
-    </span>
-  </div>
-
-  <div id="sweepHasil" style="margin-top:11px"></div>
-
-  <p style="font-size:11.5px;color:var(--dim);margin:11px 0 0">
-  <b>Penting:</b> torsi tidak bisa diubah dari sini. Kalau uji ini
-  meleset bahkan pada kecepatan rendah, masalahnya bukan kecepatan
-  melainkan <b>arus TB6600</b>. Ubah DIP switch <b>SW1/SW2/SW3</b> ke
-  1.5 sampai 2.0 A, atau turunkan microstep dari 16 ke 8.
-  Lihat <code>docs/RISET-PRESISI-STEPPER.md</code>.</p>
-</div>
-
-<div class="card"><h2>Kendali Lid</h2>
-  <div class="row"><span class="k">Buka / tutup lid</span>
-    <span>
-      <label><input type="radio" name="sisi" value="L" checked> KIRI</label>
-      <label style="margin-left:12px"><input type="radio" name="sisi" value="R"> KANAN</label>
-      <label style="margin-left:12px"><input type="radio" name="sisi" value="B"> KEDUANYA</label>
-    </span>
-  </div>
-
-  <div class="row"><span class="k">Sudut bukaan</span>
-    <span id="sudutBtns"></span>
-  </div>
-
-  <div class="row"><span class="k">Sudut lain</span>
-    <span><input id="sudutKustom" type="number" step="1" min="1" max="120"
-      style="width:72px"> &deg;
-      <button onclick="pakaiSudut()">Simpan</button></span>
-  </div>
-
-  <div class="row"><span class="k">Sudut aktif</span>
-    <b id="sudutAktif">-</b>
-  </div>
-
-  <div class="row"><span class="k">Jalankan</span>
-    <span>
-      <button class="okBtn" onclick="jalan(1)">&#9650; BUKA</button>
-      <button class="warnBtn" onclick="jalan(0)">&#9660; TUTUP</button>
-      <button onclick="c('A')">Nol-kan</button>
-    </span>
-  </div>
-
-  <div class="row"><span class="k">Posisi lid</span>
-    <b id="posSekarang">-</b>
-  </div>
-
-  <div class="row"><span class="k">Kecepatan</span>
-    <span>
-      <button onclick="c('K300')">300</button>
-      <button onclick="c('K600')">600</button>
-      <button onclick="c('K900')">900</button>
-      <button onclick="c('K1600')">1600</button>
-    </span>
-  </div>
-</div>
-
-<div class="card"><h2>Tes Cepat</h2>
-  <div class="btns">
-    <button onclick="c('IL1')">Buka KIRI</button>
-    <button onclick="c('IL0')">Tutup KIRI</button>
-    <button onclick="c('IR1')">Buka KANAN</button>
-    <button onclick="c('IR0')">Tutup KANAN</button>
-    <button onclick="c('K600')">K600 (aman)</button>
-    <button onclick="c('K900')">K900</button>
-    <button onclick="c('K1600')">K1600 (default)</button>
-    <button onclick="c('K2000')">K2000 (tercepat)</button>
-    <button class="warnBtn" onclick="c('D')">UJI DIR KIRI</button>
-    <button class="warnBtn" onclick="c('DR')">UJI DIR KANAN</button>
-    <button class="warnBtn" onclick="c('H1')">TAHAN Motor ON</button>
-    <button onclick="c('H0')">TAHAN Motor OFF</button>
-    <button onclick="c('A')">Kalibrasi 0°</button>
-    <button class="warnBtn" onclick="c('S')">Tutup KEDUA</button>
-    <button class="warnBtn" onclick="c('P')">STOP RODA</button>
-    <button class="warnBtn" onclick="fetch('/debug/reset').then(r=>r.text()).then(t=>{log('reset: '+t);load()})">
-      Reset Statistik</button>
-    <button onclick="loadLog()">Muat Ulang Log</button>
-    <button class="warnBtn" onclick="location.href='/debug/download'">
-      UNDUH LAPORAN LENGKAP</button>
-  </div>
-  <p style="font-size:11.5px;color:var(--dim);margin:8px 0 0">
-  <b>Kalau masih ada masalah:</b> tekan <b>UNDUH LAPORAN LENGKAP</b>.
-  File <code>.txt</code> akan tersimpan di HP berisi status lengkap,
-  penilaian otomatis, dan seluruh log. Kirim file itu ke pengembang.</p>
-</div>
-
-<div class="card"><h2>Log (120 terakhir)</h2>
-  <pre id="logtxt">memuat…</pre>
-</div>
-
-<script>
-const $ = id => document.getElementById(id);
-function c(v){ fetch('/cmd?val='+encodeURIComponent(v)).then(r=>r.text())
-  .catch(()=>{}); setTimeout(load,300); }
-function log(m){ console.log(m); }
-
-function diagnosa(s, jm, ja){
-  const out = [];
-  const lateRate = s.jitSamples > 0 ? (s.jitLate / s.jitSamples) : 0;
-
-  // --- kualitas jitter ---
-  if (jm < 50 && lateRate < 0.01){
-    out.push(['ok','Jitter sangat baik. Gerakan seharusnya halus.']);
-  } else if (jm < 200){
-    out.push(['warn','Jitter agak kasar ('+jm+'µs). Mungkin terasa sedikit tersentak.']);
-  } else {
-    out.push(['er','Jitter buruk ('+jm+'µs). Gerakan akan terasa tersentak.']);
-  }
-
-  // --- banyak pulsa terlambat ---
-  if (lateRate > 0.05){
-    out.push(['warn','Banyak pulsa terlambat ('+(lateRate*100).toFixed(1)+
-      '%). Coba turunkan kecepatan dengan tombol K900 atau K600.']);
-  }
-
-  // --- memori ---
-  if (s.freeHeap < 20000){
-    out.push(['er','RAM rendah ('+(s.freeHeap/1024).toFixed(0)+' KB). Restart robot.']);
-  } else if (s.freeHeap < 40000){
-    out.push(['warn','RAM agak rendah ('+(s.freeHeap/1024).toFixed(0)+' KB).']);
-  } else {
-    out.push(['ok','RAM cukup: '+(s.freeHeap/1024).toFixed(0)+' KB bebas.']);
-  }
-
-  // --- kecepatan stepper ---
-  if (s.stepSpeed > 1500){
-    out.push(['warn','Kecepatan stepper tinggi ('+s.stepSpeed.toFixed(0)+
-      ' step/s). Kalau motor bergetar, turunkan ke K900 atau K600.']);
-  }
-
-  // --- posisi tidak sesuai target (kehilangan langkah) ---
-  const dl = Math.abs(s.ll - s.llTarget);
-  const dr = Math.abs(s.lr - s.lrTarget);
-  if (dl > 1.5 || dr > 1.5){
-    out.push(['er','Posisi lid tidak sesuai target (kiri beda '+
-      dl.toFixed(1)+', kanan beda '+dr.toFixed(1)+' derajat). '+
-      'Turunkan kecepatan, naikkan arus TB6600, atau perbaiki level sinyal ke 5V.']);
-  }
-
-  // --- motor diam padahal target berbeda ---
-  if (!s.llMoving && dl > 1.5){
-    out.push(['er','Lid KIRI berhenti tapi belum sampai target. Cek kabel DIR/PUL.']);
-  }
-  if (!s.lrMoving && dr > 1.5){
-    out.push(['er','Lid KANAN berhenti tapi belum sampai target. Cek kabel DIR/PUL.']);
-  }
-
-  // --- status gerak ---
-  if (s.move !== 'stop'){
-    out.push(['warn','Roda sedang bergerak ('+s.move+').']);
-  }
-
-  // --- BROWNOUT / CRASH: penyebab gerakan tersendat yang tidak
-  //     terlihat di statistik jitter, karena statistik ikut ter-reset ---
-  if (s.brownout){
-    out.push(['er','ESP32 mengalami BROWNOUT \u2014 tegangan turun saat '+
-      'motor jalan. Ini membuat gerakan tersendat dan statistik jitter '+
-      'ter-reset sehingga sulit terlihat. SOLUSI: tambah kapasitor '+
-      '1000\u00b5F elektrolitik + 100nF keramik dekat pin 5V/3V3 ESP32, '+
-      'perkuat kabel GND, dan jangan ambil daya ESP32 dari jalur motor.']);
-  }
-  if (s.crash){
-    out.push(['er','ESP32 CRASH atau WATCHDOG. Kode macet saat gerakan. '+
-      'Kirim isi Log ke pengembang.']);
-  }
-  if (s.moveInterrupted){
-    out.push(['er','Gerakan sebelumnya TERPUTUS oleh reset \u2014 ini '+
-      'bukti kuat gerakan tersendat disebabkan ESP32 restart, bukan '+
-      'masalah timing pulsa.']);
-  }
-  if (s.bootCount > 1 && !s.brownout && !s.crash){
-    out.push(['warn','Sudah boot '+s.bootCount+' kali tanpa daya putus. '+
-      'Ada reset yang tidak normal (sebelumnya: '+s.resetName+').']);
-  }
-
-  // --- POLARITAS FIRMWARE vs WIRING ---
-  // Ini penyebab getar/tersendat yang paling sering: sinyal 3.3V
-  // common-cathode tidak cukup kuat untuk optocoupler TB6600.
-  if (s.pulseActiveLow){
-    out.push(['ok','Polaritas firmware: COMMON-ANODE 5V (aktif-LOW). '+
-      'Pastikan wiring: PUL+/DIR+/ENA+ ke 5V, PUL-/DIR-/ENA- ke GPIO, '+
-      'dan GND 5V tersambung ke GND ESP32.']);
-  } else {
-    out.push(['warn','Polaritas firmware: COMMON-CATHODE 3.3V (aktif-HIGH). '+
-      'Ini memberi hanya ~9.5mA ke optocoupler TB6600 (butuh 10-15mA) '+
-      'sehingga motor bisa TERSENDAT-SENDAT. Kalau kamu punya sumber 5V, '+
-      'ubah ke common-anode (PULSE_ACTIVE LOW) lalu upload ulang.']);
-  }
-
-  // --- DIR: deteksi "buka dan tutup berputar arah yang sama" ---
-  // Kalau firmware sudah pernah MEMERINTAHKAN dua arah (naik dan turun),
-  // maka otak sudah benar. Kalau fisiknya tetap searah, sinyal DIR tidak
-  // sampai ke TB6600.
-  if (s.movedUp && s.movedDown){
-    out.push(['ok','DIR bekerja: firmware sudah pernah memerintahkan '+
-      'arah NAIK dan TURUN. Kalau fisik tetap searah, cek wiring DIR.']);
-  } else if (s.movedUp && !s.movedDown){
-    out.push(['warn','Baru diperintahkan NAIK saja. Tekan Tutup KIRI '+
-      'supaya DIR diuji ke arah sebaliknya.']);
-  } else if (!s.movedUp && s.movedDown){
-    out.push(['warn','Baru diperintahkan TURUN saja. Tekan Buka KIRI '+
-      'supaya DIR diuji ke arah sebaliknya.']);
-  } else {
-    out.push(['warn','Belum ada gerakan. Tekan Buka KIRI lalu Tutup KIRI '+
-      'supaya DIR bisa diuji.']);
-  }
-
-  // --- PERINGATAN DAYA: penyebab paling sering "selalu searah" ---
-  // Kalau ESP32 diberi daya dari laptop sementara baterai motor dimatikan,
-  // buck converter 5V ikut mati -> TB6600 tidak dapat sinyal DIR.
-  // Kita tidak bisa mengukur 5V buck dari ESP32, jadi ini peringatan
-  // kontekstual supaya tidak terlewat saat mengejar masalah wiring.
-  out.push(['warn','DAYA: kalau ESP32 diberi daya dari laptop dan baterai '+
-    'motor dimatikan, buck converter 5V ikut mati \u2014 TB6600 tidak '+
-    'dapat tegangan di PUL+/DIR+/ENA+. Pastikan buck 5V hidup sebelum '+
-    'menyimpulkan wiring salah. Pakai tombol UJI DIR di atas.']);
-
-  // --- keterbatasan pengukuran (penting, jangan disembunyikan) ---
-  out.push(['warn','CATATAN: posisi di atas dihitung dari jumlah pulsa yang '+
-    'DIKIRIM ke driver, bukan dari sensor. Kalau motor kehilangan langkah '+
-    '(stall), angka tetap 90\u00b0 padahal lid tidak sampai. '+
-    'Kalau lid terlihat tidak sampai penuh tapi angka 90\u00b0: '+
-    'itu kehilangan langkah \u2014 turunkan kecepatan (K900 atau K600) dan '+
-    'naikkan arus TB6600.']);
-
-  return out;
-}
-
-function renderDiagnosa(items){
-  const el = document.getElementById('diagnosa');
-  el.innerHTML = items.map(function(it){
-    const cls = it[0] === 'ok' ? 'ok' : (it[0] === 'warn' ? 'warn' : 'er');
-    const ico = it[0] === 'ok' ? '✓' : (it[0] === 'warn' ? '!' : '✕');
-    return '<div class="'+cls+'" style="padding:3px 0;border-bottom:1px solid #1b232d">'+
-           '<b>'+ico+'</b> '+it[1]+'</div>';
-  }).join('');
-}
-
-function load(){
-  fetch('/debug/json',{cache:'no-store'}).then(r=>r.json()).then(s=>{
-    $('ll').textContent  = s.ll.toFixed(1);
-    $('llt').textContent = s.llTarget.toFixed(1);
-    $('lls').textContent = s.llMoving ? s.llSpeed.toFixed(0)+' step/s' : 'diam';
-    $('lr').textContent  = s.lr.toFixed(1);
-    $('lrt').textContent = s.lrTarget.toFixed(1);
-    $('lrs').textContent = s.lrMoving ? s.lrSpeed.toFixed(0)+' step/s' : 'diam';
-
-    const jm = s.jitMaxUs, ja = s.jitAvgUs;
-    $('jitmax').textContent = jm + ' µs';
-    $('jitmax').className   = jm < 50 ? 'ok' : (jm < 200 ? 'warn' : 'er');
-    $('jitavg').textContent = ja.toFixed(1) + ' µs';
-    $('jitlate').textContent = s.jitLate + ' dari ' + s.jitSamples;
-    $('jitlate').className   = s.jitLate === 0 ? 'ok' : 'warn';
-    $('steps').textContent = s.stepTotal;
-    $('jitbar').style.width = Math.min(100, jm/5) + '%';
-    $('jitbar').style.background = jm < 50 ? '#3fb950'
-      : (jm < 200 ? '#d29922' : '#f85149');
-
-    $('up').textContent  = s.uptime + ' s';
-    $('heap').textContent = (s.freeHeap/1024).toFixed(0) + ' / '
-                          + (s.minHeap/1024).toFixed(0) + ' KB';
-    $('cli').textContent = s.wifiClients;
-    $('ss').textContent  = s.stepSpeed.toFixed(0) + ' step/s';
-    $('pwm').textContent = s.pwm;
-    $('mv').textContent  = s.move;
-    $('mv').className    = s.move === 'stop' ? '' : 'warn';
-
-    $('bc').textContent  = s.bootCount;
-    $('rr').textContent   = s.resetName;
-    $('rr').className     = (s.brownout || s.crash) ? 'er'
-                          : (s.bootCount > 1 ? 'warn' : 'ok');
-    $('pol').textContent = s.pulseActiveLow
-      ? 'common-anode 5V (benar)' : 'common-cathode 3.3V (lemah)';
-    $('pol').className   = s.pulseActiveLow ? 'ok' : 'warn';
-
-    // Arah yang sudah pernah diperintahkan. Kalau keduanya muncul,
-    // otak firmware sudah benar dan masalahnya di wiring DIR.
-    const naik  = s.movedUp   ? 'BUKA' : '';
-    const turun = s.movedDown ? 'TUTUP' : '';
-    $('dirs').textContent = (naik && turun) ? 'BUKA + TUTUP (benar)'
-                          : (naik || turun || 'belum ada');
-    $('dirs').className   = (naik && turun) ? 'ok' : 'warn';
-
-    $('hold').textContent = s.holdMode ? 'AKTIF (dikunci)' : 'MATI (dilepas)';
-    $('hold').className   = s.holdMode ? 'ok' : '';
-
-    perbaruiKendali(s);
-    perbaruiPresisi(s);
-    perbaruiMotor(s);
-    perbaruiSweep(s);
-
-    renderDiagnosa(diagnosa(s, jm, ja));
-  }).catch(()=>{ $('logtxt').textContent = 'ROBOT TIDAK MERESPONS'; });
-}
-
-
-// ---------- HASIL UJI TORSI & KECEPATAN ----------
-//
-// Menampilkan ringkasan hasil sweep. Rincian per tahap ada di log,
-// jadi di sini hanya kesimpulannya supaya tidak ramai.
-function perbaruiSweep(s){
-  var el = document.getElementById('sweepHasil');
-  if (!el) return;
-
-  var n = s.sweepN || 0;
-  if (n === 0){ el.innerHTML = ''; return; }
-
-  var gagal = s.sweepGagal || 0;
-  var aman  = (typeof s.sweepAman === 'number') ? s.sweepAman / 10 : -1;
-
-  var warna, kunci, pesan;
-
-  if (aman <= 0 && gagal > 0){
-    warna = 'er';
-    kunci = 'MELESET DI SEMUA KECEPATAN';
-    pesan = 'Ini bukan masalah kecepatan. Periksa arus TB6600 (SW1-SW3, ' +
-            'butuh 1.5 sampai 2.0 A) dan coba turunkan microstep dari 16 ke 8.';
-  } else if (gagal === 0){
-    warna = 'ok';
-    kunci = 'SEMUA TAHAP TEPAT';
-    pesan = 'Motor kuat sampai tahap terakhir yang diuji. Kecepatan ' +
-            'tertinggi masih aman.';
-  } else {
-    warna = 'warn';
-    kunci = 'BATAS KETEMU';
-    pesan = 'Kecepatan aman tertinggi ' + aman + ' step/detik. ' +
-            'Pakai sekitar ' + Math.round(aman * 0.8) + ' step/detik ' +
-            'supaya ada cadangan tenaga.';
-  }
-
-  el.innerHTML =
-    '<div class="row"><span class="k">Tahap diuji</span><b>' + n + '</b></div>' +
-    '<div class="row"><span class="k">Tahap meleset</span><b class="' +
-      (gagal > 0 ? 'er' : 'ok') + '">' + gagal + '</b></div>' +
-    '<div class="row"><span class="k">Hasil</span><b class="' + warna +
-      '">' + kunci + '</b></div>' +
-    '<p style="font-size:11.5px;margin:9px 0 0" class="' + warna + '">' +
-      pesan + '</p>';
-}
-
-// ---------- MOTOR PENGGERAK ----------
-const MODE_NAMA = ['STOP', 'MAJU', 'MUNDUR', 'KIRI', 'KANAN'];
-
-let mStopTimer = null;
-
-// Selama tombol uji ditahan, kirim ulang perintahnya supaya pengaman
-// berhenti tidak memutus gerakan sebelum pengguna selesai mengamati.
-function mHeartbeat(cmd){
-  if (mStopTimer) clearInterval(mStopTimer);
-  mStopTimer = setInterval(function(){ c(cmd); }, 1500);
-}
-
-function maju(){  c('F'); mHeartbeat('F'); }
-function mback(){ c('B'); mHeartbeat('B'); }
-
-function mStop(){
-  if (mStopTimer) { clearInterval(mStopTimer); mStopTimer = null; }
-  c('P');
-}
-
-function perbaruiMotor(s){
-  document.getElementById('mStatus').textContent =
-    MODE_NAMA[s.moveMode] || '-';
-  document.getElementById('mPwm').textContent = s.pwm;
-
-  document.getElementById('mTimeout').textContent =
-    'berhenti setelah ' + s.timeoutS + ' detik tanpa perintah';
-
-  const l = document.getElementById('mBalikL');
-  const r = document.getElementById('mBalikR');
-
-  l.textContent = s.balikL ? 'DIBALIK' : 'normal';
-  l.className   = s.balikL ? 'warn' : '';
-  r.textContent = s.balikR ? 'DIBALIK' : 'normal';
-  r.className   = s.balikR ? 'warn' : '';
-}
-
-// ---------- KENDALI LID ----------
-const SUDUT_LIST = [10, 15, 30, 45, 60, 90];
-let sudutPilih = 90;      // pilihan tombol (belum tentu yang aktif)
-let sudutAktif = 90;      // sudut yang benar-benar dipakai firmware
-
-function gambarSudut(){
-  document.getElementById('sudutBtns').innerHTML = SUDUT_LIST.map(d =>
-    '<button class="' + (d === sudutPilih ? 'aktif' : '') +
-    '" onclick="pilihSudut(' + d + ')">' + d + '&deg;</button>').join(' ');
-}
-
-function pilihSudut(d){
-  sudutPilih = d;
-  document.getElementById('sudutKustom').value = d;
-  gambarSudut();
-}
-
-// Simpan sudut ke firmware (perintah W). Setelah ini tombol BUKA
-// memakai sudut tersebut.
-function pakaiSudut(){
-  let d = parseFloat(document.getElementById('sudutKustom').value);
-  if (isNaN(d)) return;
-  if (d < 1)   d = 1;
-  if (d > 120) d = 120;
-  c('W' + d);
-  sudutPilih = d;
-  gambarSudut();
-  log('sudut bukaan diset ' + d + '\u00B0');
-}
-
-function sisiTerpilih(){
-  const r = document.querySelector('input[name="sisi"]:checked');
-  return r ? r.value : 'L';
-}
-
-// 1 = BUKA sampai sudut aktif, 0 = TUTUP sampai 0 derajat
-function jalan(buka){
-  c('O' + sisiTerpilih() + (buka ? '1' : '0'));
-  log((buka ? 'BUKA' : 'TUTUP') + ' lid ' + sisiTerpilih());
-}
-
-function perbaruiPresisi(s){
-  const uji   = s.presisiUji   || 0;
-  const gagal = s.presisiGagal || 0;
-  const maks  = s.presisiMaks  || 0;
-  const spd   = s.stepsPerDeg || 4.4444;
-
-  document.getElementById('preUji').textContent   = uji;
-  document.getElementById('preGagal').textContent = gagal;
-
-  const el = document.getElementById('preMaks');
-  el.textContent = maks + ' langkah (' + (maks / spd).toFixed(2) + '\u00B0)';
-
-  const ak = document.getElementById('preAkurasi');
-  const bar = document.getElementById('preBar');
-
-  if (uji === 0){
-    ak.textContent = 'belum diuji';
-    ak.className = 'dimc';
-    bar.style.width = '0%';
-    return;
-  }
-
-  const persenTepat = ((uji - gagal) / uji) * 100;
-  ak.textContent = persenTepat.toFixed(0) + '%';
-
-  bar.style.width = Math.min(100, persenTepat) + '%';
-  bar.style.background = persenTepat >= 99.5 ? 'var(--ok)' :
-                         persenTepat >= 95   ? 'var(--warn)' : 'var(--er)';
-
-  ak.className = persenTepat >= 99.5 ? 'ok' :
-                 persenTepat >= 95   ? 'warn' : 'er';
-}
-
-function perbaruiKendali(s){
-  const maks = s.maxDeg || 120;
-  const ll = s.ll || 0, lr = s.lr || 0;
-
-  if (typeof s.lidAngle === 'number'){
-    sudutAktif = s.lidAngle;
-  }
-
-  document.getElementById('sudutAktif').textContent =
-    sudutAktif.toFixed(0) + '\u00B0';
-
-  const el = document.getElementById('posSekarang');
-  el.textContent = 'KIRI ' + ll.toFixed(0) + '\u00B0   KANAN ' + lr.toFixed(0) + '\u00B0';
-  el.title = 'Batas maksimum ' + maks + '\u00B0';
-
-  if (ll >= maks - 0.6 || lr >= maks - 0.6)      el.className = 'warn';
-  else if (ll <= 0.6 && lr <= 0.6)               el.className = 'dimc';
-  else                                            el.className = '';
-}
-
-// ---------- AKHIR KENDALI LID ----------
-
-function loadLog(){
-  fetch('/debug/log',{cache:'no-store'}).then(r=>r.text())
-    .then(t=>{
-      const el = $('logtxt');
-      el.textContent = t;
-      el.scrollTop = el.scrollHeight;   // tampilkan yang terbaru
-    })
-    .catch(()=>{ $('logtxt').textContent = 'gagal ambil log'; });
-}
-
-pilihSudut(90);
-load(); loadLog();
-setInterval(load, 1000);
-setInterval(loadLog, 3000);
-
-// Pengaman: kalau halaman ditinggalkan saat roda sedang diuji,
-// pastikan roda tidak terus berjalan.
-window.addEventListener('blur', mStop);
-document.addEventListener('visibilitychange', function(){
-  if (document.hidden) mStop();
-});
-window.addEventListener('pointerup', function(){
-  if (mStopTimer) mStop();
-});
-</script>
-</body></html>)rawliteral";
-
-// ============================================================
-//  HALAMAN /setting  -  DASHBOARD PENYETELAN
-// ============================================================
-//  Halaman ini khusus untuk MENGUBAH setelan robot, bukan untuk
-//  diagnosa. Isinya sengaja dibuat sesederhana mungkin: setiap setelan
-//  punya satu baris, penjelasan singkat, dan tombol yang jelas.
-//
-//  Dibuka lewat /setting, dan ditautkan dari /debug supaya mudah
-//  ditemukan. Tidak ada tombol di sini yang langsung menggerakkan
-//  motor, jadi halaman ini aman dibuka kapan saja tanpa mengubah
-//  posisi robot.
-const char SETTING_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
-<html lang="id"><head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Setelan SmartTrashbin</title>
-<style>
-:root{--bg:#0c1015;--pan:#141a22;--fg:#e6edf3;--dim:#8b98a8;--acc:#4ea8ff;
---bd:#212c38;--ok:#4ad07a;--warn:#ffc857;--er:#ff6b6b}
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-body{margin:0;background:var(--bg);color:var(--fg);
-font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-padding:14px 14px 40px;max-width:620px;margin:0 auto}
-h1{font-size:19px;margin:0 0 3px}
-.sub{color:var(--dim);font-size:12.5px;margin-bottom:16px}
-.card{background:var(--pan);border:1px solid var(--bd);border-radius:11px;
-padding:14px;margin-bottom:12px}
-.card h2{font-size:11.5px;margin:0 0 11px;color:var(--dim);
-text-transform:uppercase;letter-spacing:1px;font-weight:600}
-.ket{color:var(--dim);font-size:12px;margin:0 0 11px}
-.row{display:flex;justify-content:space-between;align-items:center;
-gap:10px;padding:7px 0;border-bottom:1px solid #1b232d}
-.row:last-child{border:0}
-.row .label{font-size:13.5px}
-.row .hint{color:var(--dim);font-size:11.5px;display:block;margin-top:2px}
-.nilai{font-weight:700;color:var(--acc);font-size:14px}
-.pil{display:flex;gap:7px;flex-wrap:wrap}
-button{font:inherit;font-size:13px;padding:8px 13px;border-radius:8px;
-background:#1e2833;color:var(--fg);border:1px solid var(--bd);
-cursor:pointer;touch-action:manipulation}
-button:active{background:var(--acc);color:#04121f}
-button.pilih{background:#2d4a6b;border-color:#4a7ab5;color:#cfe3ff;
-font-weight:700}
-input[type=number]{font:inherit;width:82px;padding:7px 9px;border-radius:8px;
-background:#0e141b;color:var(--fg);border:1px solid var(--bd);text-align:center}
-input[type=range]{width:100%;margin:7px 0 0;accent-color:var(--acc)}
-.ok{color:var(--ok)}.warn{color:var(--warn)}.er{color:var(--er)}
-.dimc{color:var(--dim)}
-.tab{display:flex;gap:7px;margin-bottom:15px}
-.tab a{flex:1;text-align:center;padding:9px;border-radius:9px;font-size:13px;
-background:#1a222c;color:var(--dim);text-decoration:none;
-border:1px solid var(--bd)}
-.tab a.aktif{background:var(--acc);color:#04121f;font-weight:700}
-.kaki{color:var(--dim);font-size:11.5px;text-align:center;margin-top:18px}
-</style></head><body>
-
-<h1>Setelan</h1>
-<div class="sub">Atur robot tanpa harus menggerakkannya</div>
-
-<div class="tab">
-  <a href="/">Kontrol</a>
-  <a href="/setting" class="aktif">Setelan</a>
-  <a href="/debug">Diagnosa</a>
-</div>
-
-<!-- ============ KECEPATAN ============ -->
-<div class="card">
-  <h2>Kecepatan</h2>
-  <p class="ket">Satu pilihan mengatur roda dan tutup sekaligus.</p>
-
-  <div class="pil" id="profilPil">
-    <button onclick="setProfil(0)" id="pb0">SLOW</button>
-    <button onclick="setProfil(1)" id="pb1">MEDIUM</button>
-    <button onclick="setProfil(2)" id="pb2">FAST</button>
-  </div>
-
-  <div class="row" style="margin-top:11px">
-    <span class="label">Tutup bergerak<span class="hint" id="hintTutup">-</span></span>
-    <span class="nilai" id="valTutup">-</span>
-  </div>
-  <div class="row">
-    <span class="label">Roda berputar<span class="hint" id="hintRoda">-</span></span>
-    <span class="nilai" id="valRoda">-</span>
-  </div>
-
-  <p class="ket" style="margin:11px 0 0" id="ketProfil">-</p>
-</div>
-
-<!-- ============ BUKAAN ============ -->
-<div class="card">
-  <h2>Bukaan Tutup</h2>
-  <p class="ket">Sudut ini dipakai setiap kali tutup dibuka.</p>
-
-  <div class="pil" id="sudutPil">
-    <button onclick="setSudut(30)">30&deg;</button>
-    <button onclick="setSudut(45)">45&deg;</button>
-    <button onclick="setSudut(60)">60&deg;</button>
-    <button onclick="setSudut(90)">90&deg;</button>
-    <button onclick="setSudut(120)">120&deg;</button>
-  </div>
-
-  <div class="row" style="margin-top:11px">
-    <span class="label">Sudut lain</span>
-    <span>
-      <input type="number" id="sudutKustom" min="1" max="120" step="1" value="90">
-      <button onclick="pakaiSudutKustom()">Simpan</button>
-    </span>
-  </div>
-
-  <div class="row">
-    <span class="label">Sudut aktif</span>
-    <span class="nilai" id="valSudut">-</span>
-  </div>
-</div>
-
-<!-- ============ ARAH MOTOR ============ -->
-<div class="card">
-  <h2>Arah Motor Roda</h2>
-  <p class="ket">Kalau robot bergerak terbalik dari tombolnya, balik
-  arah di sini. Tidak perlu membongkar kabel.</p>
-
-  <div class="row">
-    <span class="label">Motor kiri</span>
-    <span>
-      <button onclick="setArah('L',1)" id="bl1">Balik</button>
-      <button onclick="setArah('L',0)" id="bl0">Normal</button>
-    </span>
-  </div>
-  <div class="row">
-    <span class="label">Motor kanan</span>
-    <span>
-      <button onclick="setArah('R',1)" id="br1">Balik</button>
-      <button onclick="setArah('R',0)" id="br0">Normal</button>
-    </span>
-  </div>
-
-  <div class="pil" style="margin-top:11px">
-    <button onclick="c('F')" style="flex:1">Uji MAJU</button>
-    <button onclick="c('P')" style="flex:1">STOP</button>
-  </div>
-  <p class="ket" style="margin:9px 0 0">Tekan Uji MAJU sebentar saja
-  untuk memastikan arahnya sudah benar.</p>
-</div>
-
-<!-- ============ BELOK ============ -->
-<div class="card">
-  <h2>Belok di Tempat</h2>
-  <p class="ket">Kalau saat berbelok ada roda yang seperti tidak jalan,
-  naikkan <b>tenaga belok</b>. Berbelok menyeret roda ke samping,
-  jadi bebannya lebih berat daripada maju.</p>
-
-  <div class="row">
-    <span class="label">Tenaga tambahan saat belok
-      <span class="hint" id="hintBelok">-</span></span>
-    <span class="nilai" id="valBelok">-</span>
-  </div>
-  <input type="range" id="belok" min="0" max="90" value="45">
-  <div class="pil" style="margin-top:9px">
-    <button onclick="setBelok(0)">0</button>
-    <button onclick="setBelok(30)">30</button>
-    <button onclick="setBelok(45)">45</button>
-    <button onclick="setBelok(70)">70</button>
-    <button onclick="setBelok(90)">90</button>
-  </div>
-
-  <div class="row" style="margin-top:13px">
-    <span class="label">Uji putar<span class="hint">Tekan dan tahan</span></span>
-    <span>
-      <button id="bputarL" onmousedown="putar('L')" onmouseup="stopRoda()"
-        ontouchstart="putar('L')" ontouchend="stopRoda()">&#9664; KIRI</button>
-      <button id="bputarR" onmousedown="putar('R')" onmouseup="stopRoda()"
-        ontouchstart="putar('R')" ontouchend="stopRoda()">KANAN &#9654;</button>
-    </span>
-  </div>
-</div>
-
-<!-- ============ KESEIMBANGAN RODA ============ -->
-<div class="card">
-  <h2>Keseimbangan Roda</h2>
-  <p class="ket">Pakai kalau saat maju robot tidak lurus. Naikkan angka
-  untuk roda yang <b>lemah</b>, jangan turunkan roda yang kuat, supaya
-  tenaga robot tidak berkurang.</p>
-
-  <div class="row">
-    <span class="label">Kompensasi roda kiri
-      <span class="hint" id="hintKL">-</span></span>
-    <span class="nilai" id="valKL">-</span>
-  </div>
-  <input type="range" id="kl" min="-60" max="60" value="0">
-  <div class="pil" style="margin-top:7px">
-    <button onclick="setKomp('L',-20)">-20</button>
-    <button onclick="setKomp('L',-10)">-10</button>
-    <button onclick="setKomp('L',0)">0</button>
-    <button onclick="setKomp('L',10)">+10</button>
-    <button onclick="setKomp('L',20)">+20</button>
-  </div>
-
-  <div class="row" style="margin-top:13px">
-    <span class="label">Kompensasi roda kanan
-      <span class="hint" id="hintKR">-</span></span>
-    <span class="nilai" id="valKR">-</span>
-  </div>
-  <input type="range" id="kr" min="-60" max="60" value="0">
-  <div class="pil" style="margin-top:7px">
-    <button onclick="setKomp('R',-20)">-20</button>
-    <button onclick="setKomp('R',-10)">-10</button>
-    <button onclick="setKomp('R',0)">0</button>
-    <button onclick="setKomp('R',10)">+10</button>
-    <button onclick="setKomp('R',20)">+20</button>
-  </div>
-
-  <div class="pil" style="margin-top:13px">
-    <button onclick="c('F')" style="flex:1">Uji MAJU</button>
-    <button onclick="stopRoda()" style="flex:1">STOP</button>
-  </div>
-
-  <div class="row" style="margin-top:11px">
-    <span class="label">PWM akhir tiap roda</span>
-    <span class="nilai" id="valAkhir">-</span>
-  </div>
-</div>
-
-<!-- ============ MODE TAHAN ============ -->
-<div class="card">
-  <h2>Mode Tahan Tutup</h2>
-  <p class="ket">Saat aktif, motor tutup terus diberi arus sehingga
-  tutup tidak turun sendiri karena beratnya. Motor akan terasa hangat,
-  dan baterai lebih cepat habis.</p>
-
-  <div class="row">
-    <span class="label">Tahan tutup</span>
-    <span>
-      <button onclick="setTahan(1)" id="bh1">Aktif</button>
-      <button onclick="setTahan(0)" id="bh0">Mati</button>
-    </span>
-  </div>
-</div>
-
-<!-- ============ SISTEM ============ -->
-<div class="card">
-  <h2>Sistem</h2>
-  <div class="row"><span class="label">Kecepatan roda langsung</span>
-    <span class="nilai"><span id="valPwm">-</span></span></div>
-  <input type="range" id="pwm" min="0" max="255" value="165">
-  <p class="ket" style="margin:8px 0 0">Geser untuk mengubah kecepatan
-  roda saja, tanpa mengubah kecepatan tutup.</p>
-
-  <div class="row" style="margin-top:12px">
-    <span class="label">Nolkan posisi tutup</span>
-    <button onclick="c('A')">Kalibrasi 0&deg;</button>
-  </div>
-
-  <div class="row">
-    <span class="label">Jalankan ulang robot</span>
-    <button onclick="reboot()">Muat Ulang</button>
-  </div>
-
-  <div class="row">
-    <span class="label">Status</span>
-    <span class="nilai" id="valStatus">-</span>
-  </div>
-
-  <!-- Pengingat setelan microstep. Kalau DIP switch TB6600 diubah
-       tanpa mengubah firmware, semua sudut jadi salah, jadi nilai
-       yang berlaku ditampilkan di sini supaya mudah dicocokkan. -->
-  <div class="row">
-    <span class="label">Microstep firmware
-      <span class="hint">harus sama dengan DIP switch SW1-SW3</span></span>
-    <span class="nilai" id="valMicro">-</span>
-  </div>
-</div>
-
-<div class="kaki">
-  Setelan tersimpan di memori robot dan tetap ada setelah dimatikan.<br>
-  <span id="pesan">-</span>
-</div>
-
-<script>
-var $ = function(i){ return document.getElementById(i); };
-var bawaTimer = null;
-
-function pesan(t, jenis){
-  var el = $('pesan');
-  el.textContent = t;
-  el.className = jenis || 'dimc';
-  if (bawaTimer) clearTimeout(bawaTimer);
-  bawaTimer = setTimeout(function(){ el.textContent = '-';
-    el.className = 'dimc'; }, 2500);
-}
-
-/* Kirim perintah ke firmware */
-function c(v){
-  fetch('/cmd?val=' + encodeURIComponent(v), {cache:'no-store'})
-    .then(function(r){ if (!r.ok) throw 0; return r.text(); })
-    .then(function(){ muat(); })
-    .catch(function(){ pesan('Robot tidak merespons', 'er'); });
-}
-
-/* Ketiga fungsi di bawah ini mengubah setelan, jadi selalu beri tahu
-   pengguna bahwa setelannya sudah tersimpan. */
-function setProfil(p){
-  c('N' + p);
-  var n = ['SLOW', 'MEDIUM', 'FAST'][p] || '?';
-  pesan('Kecepatan: ' + n, 'ok');
-}
-
-function setSudut(d){
-  d = Math.max(1, Math.min(120, d));
-  c('W' + d);
-  pesan('Sudut bukaan: ' + d + '\u00B0', 'ok');
-}
-
-function pakaiSudutKustom(){
-  var d = parseFloat($('sudutKustom').value);
-  if (isNaN(d)) { pesan('Angka tidak valid', 'er'); return; }
-  d = Math.max(1, Math.min(120, d));
-  $('sudutKustom').value = d;
-  setSudut(d);
-}
-
-function setArah(sisi, balik){
-  c('Y' + sisi + balik);
-  pesan('Motor ' + (sisi === 'L' ? 'kiri' : 'kanan') + ': ' +
-        (balik ? 'DIBALIK' : 'normal'), 'ok');
-}
-
-function setTahan(on){
-  c('H' + on);
-  pesan('Mode tahan: ' + (on ? 'AKTIF' : 'mati'), 'ok');
-}
-
-function reboot(){
-  if (!confirm('Jalankan ulang robot? Posisi tutup akan dianggap 0 derajat.')) return;
-  fetch('/debug/reset', {cache:'no-store'}).catch(function(){});
-  pesan('Robot dijalankan ulang', 'ok');
-}
-
-/* Slider PWM mengubah kecepatan roda saja */
-var slider = $('pwm');
-slider.addEventListener('input', function(){ $('valPwm').textContent = slider.value; });
-slider.addEventListener('change', function(){ c('V' + slider.value); });
-$('valPwm').textContent = slider.value;
-
-/* Tandai tombol yang sedang aktif supaya pengguna tahu setelan mana
-   yang berlaku sekarang. */
-function tandai(id, aktif){
-  var el = $(id);
-  if (!el) return;
-  el.className = aktif ? 'pilih' : '';
-}
-
-var KET = [
-  'Paling halus dan paling kuat. Kecepatan tutup rendah, jadi torsi yang tersedia paling besar. Ini pilihan terbaik untuk mekanisme gear yang berat, dan untuk menghemat baterai.',
-  'Seimbang. Cocok dipakai sehari-hari setelah mekanisme terbukti lancar pada SLOW.',
-  'Paling cepat. Pakai hanya kalau mekanisme sudah terbukti tidak pernah kehilangan langkah. Pada beban gear yang berat, kecepatan tinggi mengurangi torsi yang tersedia.'
-];
-
-/* Kecepatan gerak lid sudah diperhitungkan untuk microstep 1/8.
-   Pada microstep 1/8, 1600 pulsa = satu putaran penuh motor, jadi
-   angka step per detik di sini separuh dari nilai lama, tetapi
-   kecepatan lid yang terlihat tetap sama. */
-var TUTUP_MS = [ 'paling halus, torsi terbesar',
-                 'seimbang',
-                 'paling cepat' ];
-var RODA_KET = [ 'pelan', 'sedang', 'kencang' ];
-
-/* ---------- BELOK DI TEMPAT ---------- */
-
-var putarTimer = null;
-
-/* Selama tombol putar ditahan, kirim ulang perintahnya supaya roda
-   tidak berhenti sendiri gara-gara pengaman waktu di firmware. */
-function putar(arah){
-  c(arah);
-  if (putarTimer) clearInterval(putarTimer);
-  putarTimer = setInterval(function(){ c(arah); }, 1500);
-}
-
-function stopRoda(){
-  if (putarTimer) { clearInterval(putarTimer); putarTimer = null; }
-  c('P');
-}
-
-function setBelok(v){
-  c('ZB' + v);
-  pesan('Tenaga belok: +' + v, 'ok');
-}
-
-/* ---------- KESEIMBANGAN RODA ---------- */
-
-function setKomp(sisi, v){
-  c('Z' + sisi + v);
-  pesan('Kompensasi ' + (sisi === 'L' ? 'kiri' : 'kanan') +
-        ': ' + (v > 0 ? '+' : '') + v, 'ok');
-}
-
-var sliderBelok = $('belok');
-var sliderKL = $('kl');
-var sliderKR = $('kr');
-
-/* Saat slider digeser, tampilkan angkanya saja. Perintah baru
-   dikirim ketika jari diangkat, supaya tidak membanjiri robot
-   dengan puluhan perintah. */
-sliderBelok.addEventListener('input',
-  function(){ $('valBelok').textContent = '+' + sliderBelok.value; });
-sliderBelok.addEventListener('change',
-  function(){ setBelok(sliderBelok.value); });
-
-sliderKL.addEventListener('input',
-  function(){ $('valKL').textContent = tanda(sliderKL.value); });
-sliderKL.addEventListener('change',
-  function(){ setKomp('L', sliderKL.value); });
-
-sliderKR.addEventListener('input',
-  function(){ $('valKR').textContent = tanda(sliderKR.value); });
-sliderKR.addEventListener('change',
-  function(){ setKomp('R', sliderKR.value); });
-
-function tanda(v){
-  v = parseInt(v, 10);
-  return (v > 0 ? '+' : '') + v;
-}
-
-/* ---------- KUMPULKAN STATUS ---------- */
-
-function muat(){
-  fetch('/status', {cache:'no-store'})
-    .then(function(r){ return r.json(); })
-    .then(function(s){
-      var p = (typeof s.profil === 'number') ? s.profil : 1;
-
-      for (var i = 0; i < 3; i++) tandai('pb' + i, i === p);
-
-      $('hintTutup').textContent = TUTUP_MS[p] || '';
-      $('hintRoda').textContent  = RODA_KET[p] || '';
-      $('ketProfil').textContent = KET[p] || '';
-
-      $('valTutup').textContent = (s.sp || 0) + ' step/detik';
-      $('valRoda').textContent  = (s.pwm || 0) + ' PWM';
-
-      if (typeof s.lidAngle === 'number'){
-        var d = Math.round(s.lidAngle);
-        $('valSudut').textContent = d + '\u00B0';
-        $('sudutKustom').value = d;
-        ['30','45','60','90','120'].forEach(function(v){
-          var btn = document.querySelector('#sudutPil button[onclick*="setSudut('+v+')"]');
-          if (btn) btn.className = (parseInt(v,10) === d) ? 'pilih' : '';
-        });
-      }
-
-      $('bl1').className = s.balikL ? 'pilih' : '';
-      $('bl0').className = s.balikL ? '' : 'pilih';
-      $('br1').className = s.balikR ? 'pilih' : '';
-      $('br0').className = s.balikR ? '' : 'pilih';
-
-      $('bh1').className = s.holdMode ? 'pilih' : '';
-      $('bh0').className = s.holdMode ? '' : 'pilih';
-
-      /* Setelan roda: baca dari robot, jangan disimpan di halaman.
-         Supaya kalau dibuka dari HP lain tampilannya tetap benar. */
-      if (typeof s.belok === 'number'){
-        sliderBelok.value = s.belok;
-        $('valBelok').textContent = '+' + s.belok;
-        $('hintBelok').textContent = s.belok < 20
-          ? 'masih rendah, roda bisa tersendat saat berbelok'
-          : (s.belok > 70 ? 'tinggi, hati-hati arus driver'
-                          : 'nilai yang wajar');
-      }
-
-      if (typeof s.kompKiri === 'number'){
-        sliderKL.value = s.kompKiri;
-        $('valKL').textContent = tanda(s.kompKiri);
-        $('hintKL').textContent = s.kompKiri === 0
-          ? 'tidak ada kompensasi' : 'roda kiri diberi PWM lebih tinggi';
-      }
-
-      if (typeof s.kompKanan === 'number'){
-        sliderKR.value = s.kompKanan;
-        $('valKR').textContent = tanda(s.kompKanan);
-        $('hintKR').textContent = s.kompKanan === 0
-          ? 'tidak ada kompensasi' : 'roda kanan diberi PWM lebih tinggi';
-      }
-
-      if (typeof s.pwmKiri === 'number'){
-        $('valAkhir').textContent = s.pwmKiri + ' / ' + s.pwmKanan;
-      }
-
-      /* Tampilkan setelan microstep yang dipakai firmware. Cocokkan
-         dengan DIP switch SW1-SW3 di modul TB6600. */
-      if (typeof s.stepsPerDeg === 'number'){
-        var bagi;
-        if (s.stepsPerDeg < 0.8)      bagi = '1/1';
-        else if (s.stepsPerDeg < 1.8) bagi = '1/2';
-        else if (s.stepsPerDeg < 3.4) bagi = '1/4';
-        else if (s.stepsPerDeg < 6.6) bagi = '1/8';
-        else if (s.stepsPerDeg < 13)  bagi = '1/16';
-        else                          bagi = '1/32';
-
-        $('valMicro').textContent = bagi + ' (' +
-          Math.round(s.stepsPerDeg * 360) + ' pulsa/putaran)';
-      }
-
-      if (document.activeElement !== slider){
-        slider.value = s.pwm || 0;
-        $('valPwm').textContent = slider.value;
-      }
-
-      $('valStatus').textContent = 'terhubung';
-      $('valStatus').className = 'nilai ok';
-    })
-    .catch(function(){
-      $('valStatus').textContent = 'tidak terhubung';
-      $('valStatus').className = 'nilai er';
-    });
-}
-
-muat();
-setInterval(muat, 2000);
-</script>
-</body></html>)rawliteral";
-
+// Both pages are served straight from flash, so no RAM is used for the markup.
 void handleSettingPage() {
   server.send_P(200, "text/html", SETTING_HTML);
 }
@@ -4187,7 +3298,6 @@ void handleDebugPage() {
 }
 
 // ==================== BLE CALLBACK ====================
-
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* s) override {
     bleConnected = true;
@@ -4234,17 +3344,11 @@ void sendBleStatus() {
 
 // ==================== SETUP ====================
 
-// ============================================================
-//  KENDALI BLE ADVERTISING  (dipakai perintah 'X')
-// ============================================================
-//
-//  BLE memakai radio dan flash bersama WiFi. Akses flash bisa menahan
-//  seluruh chip (cache stall), dan itulah yang diukur sebagai perioda
-//  pulsa panjang (max 32368 us = 32 ms, khas durasi operasi flash).
-//
-//  Karena WiFi adalah jalur utama, BLE boleh dimatikan saat menguji
-//  untuk melihat apakah pulsa jadi lebih rapi.
-
+// ==================== BLE ADVERTISING CONTROL (used by command 'X') ====================
+// BLE shares the radio and flash with WiFi. Flash access can stall the whole chip
+// (cache stall), which is what shows up as long pulse periods (max 32368 us =
+// 32 ms, typical flash operation duration). WiFi is the primary link, so BLE may
+// be switched off during testing to see whether the pulses get cleaner.
 bool bleDiinit = false;
 
 void BLEAdvertising_stop() {
@@ -4262,24 +3366,17 @@ void BLEAdvertising_start() {
 void setup() {
   Serial.begin(115200);
   delay(400);
-
-  // Baca alasan reset SEBELUM apa pun, karena RTC memory bisa terpakai
-  // proses lain. Ini yang membuktikan apakah gerakan tersendat
-  // disebabkan ESP32 reset di tengah jalan (brownout).
+  // Read the reset reason BEFORE anything else, since RTC memory may be used by
+  // other processes. This is what proves whether a stuttering movement came from
+  // a mid-run ESP32 reset (brownout).
   resetTrackerBegin();
-
-  // Muat sudut global yang terakhir diatur dari flash, supaya setelan
-  // tidak hilang saat ESP32 dimatikan.
+  // Load the last global angle from flash so the setting survives power-off.
   muatSudutGlobal();
-
-  // Pulihkan pilihan profil kecepatan terakhir (SLOW/MEDIUM/FAST).
+  // Restore the last speed profile (SLOW/MEDIUM/FAST).
   muatProfil();
-
-  // Buang sampah di buffer serial. Kalau monitor/host sempat menumpuk
-  // perintah lama, perintah itu akan langsung dieksekusi saat boot dan
-  // bisa terlihat seperti robot bertingkah sendiri.
+  // Flush junk in the serial buffer. Leftover buffered commands from a monitor/host
+  // would otherwise execute right at boot and look like the robot acting on its own.
   while (Serial.available()) Serial.read();
-
   Serial.println();
   Serial.println("==========================================");
   Serial.println("  SMART TRASHBIN - WIFI AP + BLE");
@@ -4292,14 +3389,11 @@ void setup() {
   if (moveInterrupted) {
     Serial.println("  !! Gerakan TERPUTUS oleh reset sebelumnya !!");
   }
-
   motorBegin();
   addLog("[OK] Motor DC siap (BTN7970)");
-
   stepperBegin(stLidLeft);
   stepperBegin(stLidRight);
   addLogf("[OK] Stepper siap. 1 deg = %.3f step", STEPS_PER_DEG);
-
   // ---------- WiFi Access Point ----------
   WiFi.mode(WIFI_AP);
   bool apOk = WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, false, AP_MAX_CONN);
@@ -4311,7 +3405,6 @@ void setup() {
   } else {
     addLog("[ERROR] Gagal membuat Access Point!");
   }
-
   // ---------- Web server ----------
   server.on("/",            handleRoot);
   server.on("/setting",     handleSettingPage);
@@ -4325,13 +3418,10 @@ void setup() {
   server.onNotFound(handleNotFound);
   server.begin();
   addLog("[OK] Web server jalan di port 80");
-
-  // ---------- Laporan kondisi daya ----------
-  // Ini yang membuktikan apakah gerakan tersendat disebabkan ESP32
-  // reset di tengah gerakan (brownout). Tampil di /debug.
+  // ---------- Power condition report (shown on /debug) ----------
+  // Proves whether a stuttering movement came from a mid-move reset (brownout).
   addLogf("[BOOT] Boot ke-%u, alasan reset: %s",
           (unsigned)bootCount, resetReasonName(bootResetReason));
-
   if (brownoutSuspect) {
     addLog("[WARN] BROWNOUT - tegangan turun saat gerakan!");
     addLog("[WARN] Tambah kapasitor 1000uF dekat ESP32 + pastikan GND kuat");
@@ -4342,32 +3432,25 @@ void setup() {
   if (moveInterrupted) {
     addLog("[WARN] Gerakan sebelumnya TERPUTUS oleh reset!");
   }
-
-  // ---------- Task stepper di CORE 1 (anti-jitter) ----------
-  // Ini pengganti loop()-based pulsing. Karena berjalan di core terpisah
-  // dari WiFi, pulsa stepper tidak lagi tertunda oleh request HTTP.
+  // ---------- Stepper task on CORE 1 (anti-jitter) ----------
+  // Replaces loop()-based pulsing: on a separate core from WiFi, stepper pulses
+  // are no longer delayed by HTTP requests.
   stepperTaskStart();
-
-  // ---------- BLE (cadangan) ----------  // Diinit di sini, tapi bisa dimatikan/dihidupkan lewat perintah X.
+  // ---------- BLE (fallback) ----------  // Inited here, but can be turned off/on with command X.
   BLEDevice::init(BLE_NAME);
-  bleDiinit = true;              // tandai BLE sudah diinit
+  bleDiinit = true;              // mark BLE as inited
   bleServer = BLEDevice::createServer();
   bleServer->setCallbacks(new ServerCallbacks());
-
   BLEService* svc = bleServer->createService(SERVICE_UUID);
-
   charTX = svc->createCharacteristic(
       CHAR_TX_UUID,
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
   charTX->addDescriptor(new BLE2902());
-
   BLECharacteristic* charRX = svc->createCharacteristic(
       CHAR_RX_UUID,
       BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
   charRX->setCallbacks(new RxCallbacks());
-
   svc->start();
-
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(SERVICE_UUID);
   adv->setScanResponse(true);
@@ -4375,9 +3458,7 @@ void setup() {
   adv->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
   addLog("[OK] BLE advertising aktif (bisa dimatikan dengan XB1)");
-
   lastCmdMillis = millis();
-
   Serial.println("------------------------------------------");
   Serial.println("Perintah serial (akhiri dengan Enter):");
   Serial.println("  F B L R P   = maju/mundur/pivot/stop");
@@ -4393,33 +3474,27 @@ void setup() {
 }
 
 // ==================== LOOP ====================
-
 void loop() {
   server.handleClient();
-
-  // CATATAN: stepper TIDAK lagi dilayani dari loop().
-  // Pulsa stepper dikeluarkan oleh task di CORE 1 (stepperTaskCore1),
-  // sehingga tidak terpengaruh oleh lambatnya server.handleClient() / WiFi.
-  // Ini yang menghilangkan jitter.
-
-  // --- watchdog: kalau HP hilang di tengah gerak, robot harus berhenti ---
-  // Hanya berlaku saat roda memang sedang jalan. Setelah distop, moveMode
-  // diubah ke MOVE_STOP sehingga pesan ini tercetak SEKALI, bukan berulang.
+  // NOTE: the stepper is no longer serviced from loop(). Pulses come from the
+  // CORE 1 task (stepperTaskCore1), so slow server.handleClient() / WiFi cannot
+  // delay them. That is what removes the jitter.
+  // --- watchdog: if the phone vanishes mid-move, the robot must stop ---
+  // Only fires while the wheels run. After the stop, moveMode becomes MOVE_STOP so
+  // this prints ONCE, not repeatedly.
   if (moveMode != MOVE_STOP && (millis() - lastCmdMillis > CMD_TIMEOUT_MS)) {
     moveMode = MOVE_STOP;
     motorStop();
     addLogf("[SAFETY] Tidak ada perintah %lus - roda distop",
             CMD_TIMEOUT_MS / 1000);
   }
-
-  // --- perintah lewat Serial USB (untuk tes tanpa HP) ---
-  // PENTING: perintah dibaca sebagai SATU BARIS PENUH, bukan per karakter.
-  // Kalau dibaca per karakter, "IL1" akan terpecah jadi 'I', 'L', '1' —
-  // dan huruf 'L' akan salah dieksekusi sebagai pivot kiri (roda bergerak!).
+  // --- commands over USB Serial (for testing without a phone) ---
+  // IMPORTANT: commands are read as ONE FULL LINE, not per character. A
+  // per-character parser splits "IL1" into 'I', 'L', '1' and the 'L' is wrongly
+  // executed as a left pivot (the wheels move!).
   static String serLine = "";
   while (Serial.available()) {
     char c = Serial.read();
-
     if (c == '\n' || c == '\r') {
       serLine.trim();
       if (serLine.length() > 0) {
@@ -4436,14 +3511,15 @@ void loop() {
       }
       continue;
     }
-
-    if (serLine.length() < 32) serLine += c;   // batasi panjang, hindari overflow
+    if (serLine.length() < 32) serLine += c;   // length cap to avoid overflow
   }
-
-  // --- laporan status BLE tiap 1 detik ---
+  // --- BLE status report every 1 second ---
   static unsigned long lastReport = 0;
   if (bleConnected && millis() - lastReport > 1000) {
     lastReport = millis();
     sendBleStatus();
   }
+  // --- deferred flash write: only once the lids are idle ---
+  flushKotor();
 }
+

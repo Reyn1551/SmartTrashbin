@@ -1,17 +1,19 @@
-# --- Hasil build Arduino ---
+# --- Arduino build output ---
 build/
+.build/
 *.bin
 *.elf
 *.map
 *.hex
 
-# --- Cadangan editor ---
+# --- Editor backups ---
 *~
 *.bak
+*.bak-*
 *.orig
 *.swp
 
-# --- Sistem operasi ---
+# --- OS ---
 Thumbs.db
 desktop.ini
 .DS_Store
@@ -20,6 +22,7 @@ desktop.ini
 __pycache__/
 *.pyc
 
-# --- Log hasil pengujian ---
+# --- Captured test logs ---
 log-smarttrashbin-*.txt
 trashbin-*s-boot*.txt
+hasil-cek-stepper.txt

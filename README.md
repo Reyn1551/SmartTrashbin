@@ -1,167 +1,132 @@
 # SmartTrashbin
 
-Robot tong sampah pintar berbasis ESP32. Dua motor DC untuk penggerak roda
-(driver BTN7970) dan dua motor stepper NEMA 17 untuk membuka dan menutup
-tutup tong (driver TB6600). Kontrol utama lewat WiFi, Bluetooth sebagai
-cadangan.
+An ESP32 robot trash bin. Two DC motors drive the wheels through BTN7970
+drivers, and two NEMA 17 steppers open and close the lid through TB6600 drivers.
 
-ESP32 memancarkan hotspot sendiri, dan antarmuka kontrolnya sudah tertanam
-di dalam firmware, jadi tidak perlu aplikasi tambahan dan tidak perlu
-internet.
+The ESP32 runs its own WiFi hotspot and serves the control panel from inside the
+firmware, so there is nothing to install on your phone and no internet needed.
+Bluetooth is there as a backup control path.
 
 | | |
 |---|---|
-| Nama hotspot | `SmartTrashbin` |
+| Hotspot | `SmartTrashbin` |
 | Password | `12345678` |
-| Alamat kontrol | http://192.168.4.1 |
-| Halaman diagnosa | http://192.168.4.1/debug |
+| Control panel | http://192.168.4.1 |
+| Diagnostics | http://192.168.4.1/debug |
 
-## Perangkat keras
+## Using it
 
-| Bagian | Komponen |
+1. Power the robot on.
+2. On your phone, join the WiFi network `SmartTrashbin` with password `12345678`.
+   Android will ask whether to stay connected with no internet. Say yes, and turn
+   mobile data off so the phone does not wander back to it.
+3. Open http://192.168.4.1
+
+The arrow buttons on the left drive the robot while you hold them. The buttons on
+the right open and close the lid. Rotate the phone to landscape and tap the panel
+to open it.
+
+If something feels wrong, a lid moving roughly or a wheel that will not turn, open
+http://192.168.4.1/debug from the phone. It reads the jitter statistics and tells
+you what it thinks is wrong, without needing a laptop.
+
+## Hardware
+
+Wiring, pinout, DIP switch settings, and the faults this robot has actually
+produced are all in **[HARDWARE.md](HARDWARE.md)**. Read that before rewiring
+anything. The stepper signal wiring in particular is not what you would guess.
+
+Short version: the TB6600 inputs need 5 V and the GPIO pins sink to ground
+(common-anode, active-LOW). The firmware is set up for this, so do not pair that
+wiring with active-HIGH firmware.
+
+## Commands
+
+Sent over HTTP (`/cmd?val=X`), Bluetooth, or serial at 115200 baud.
+
+| Command | Action |
 |---|---|
-| Pengendali | ESP32 DevKit V4 32D (ESP32-D0WD-V3 rev 3.1) |
-| Penggerak roda | BTN7970 x2 |
-| Motor roda | DC gearbox, differential drive |
-| Penggerak tutup | TB6600 x2 |
-| Motor tutup | NEMA 17, 1.8 derajat |
+| `F` / `B` | forward / backward |
+| `L` / `R` | pivot left / right |
+| `P` | stop |
+| `V<n>` | wheel PWM, 0–255 |
+| `N0` / `N1` / `N2` | speed profile SLOW / MEDIUM / FAST |
+| `C` / `S` | open / close both lids |
+| `IL1` / `IL0` | open / close left lid |
+| `IR1` / `IR0` | open / close right lid |
+| `W<angle>` | set the opening angle |
+| `A` | calibrate: current position is 0° |
+| `K<sps>` | stepper speed in steps per second |
 
-### Pemetaan pin
+Angle and motor-direction settings go to flash and survive a power cut.
 
-| Fungsi | GPIO |
-|---|---|
-| Roda kiri PWM / D1 / D2 | 25 / 27 / 26 |
-| Roda kanan PWM / D1 / D2 | 33 / 32 / 14 |
-| Tutup kiri PUL / DIR / ENA | 18 / 19 / 23 |
-| Tutup kanan PUL / DIR / ENA | 15 / 4 / 5 |
-
-Sisi positif TB6600 (PUL+, DIR+, ENA+) dihubungkan ke 5V dari buck
-converter, dan GND 5V wajib disambungkan ke GND ESP32.
-
-## Cara pakai
-
-1. Nyalakan robot.
-2. Di HP, sambungkan WiFi ke jaringan `SmartTrashbin` dengan password
-   `12345678`. Kalau Android bertanya "WiFi tanpa internet, tetap
-   sambungkan?", jawab **Tetap Sambungkan**. Matikan data seluler supaya
-   HP tidak berpindah kembali ke internet.
-3. Buka browser ke http://192.168.4.1
-
-Tombol arah di sisi kiri menggerakkan robot selama tombol **ditahan**.
-Tombol di sisi kanan membuka dan menutup tutup.
-
-## Build dan upload
-
-Proyek ini memakai `arduino-cli` dengan core ESP32 versi 3.x.
+## Build and upload
 
 ```powershell
 arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app --upload -p COM6 .
 ```
 
-Skema partisi `huge_app` **wajib** dipakai. Firmware dengan UI yang
-tertanam berukuran sekitar 1,76 MB, dan skema partisi bawaan tidak cukup
-besar.
+The `huge_app` partition scheme is required. The firmware with its embedded UI is
+about 1.8 MB and the default scheme is too small.
 
-### Mengubah tampilan kontrol
+### Changing the web pages
 
-File `web_ui.h` adalah hasil generate, jangan disunting langsung. Sunting
-`controller-wifi.html`, lalu jalankan:
+The three pages are generated, and the headers are not meant to be edited:
+
+| Source | Header | Page |
+|---|---|---|
+| `controller-wifi.html` | `web_ui.h` | `/` |
+| `debug-page.html` | `debug_ui.h` | `/debug` |
+| `setting-page.html` | `setting_ui.h` | `/setting` |
+
+Edit the `.html` file, then run:
 
 ```powershell
 python konversi-html.py
 ```
 
-Skrip itu menulis ulang `web_ui.h` dari HTML. Setelah itu baru compile dan
-upload.
+That rewrites the three headers. Compile and upload after that.
 
-## Perintah
-
-Perintah bisa dikirim lewat HTTP (`/cmd?val=X`), lewat Bluetooth, atau
-lewat Serial pada 115200 baud.
-
-### Roda
-
-| Perintah | Fungsi |
-|---|---|
-| `F` / `B` | maju / mundur |
-| `L` / `R` | belok kiri / kanan |
-| `P` | stop |
-| `V<n>` | kecepatan PWM, 0 sampai 255 |
-
-### Tutup
-
-| Perintah | Fungsi |
-|---|---|
-| `C` / `S` | buka / tutup kedua tutup |
-| `IL1` / `IL0` | buka / tutup tutup kiri |
-| `IR1` / `IR0` | buka / tutup tutup kanan |
-| `W<sudut>` | atur sudut bukaan, dipakai semua perintah buka |
-| `A` | kalibrasi, posisi sekarang dianggap 0 derajat |
-| `K<sps>` | kecepatan stepper, step per detik |
-
-### Penyetelan
-
-| Perintah | Fungsi |
-|---|---|
-| `YL1` / `YL0` | balik / normalkan arah motor kiri |
-| `YR1` / `YR0` | balik / normalkan arah motor kanan |
-| `H1` / `H0` | mode tahan motor, motor dikunci atau dilepas |
-| `D` | uji arah, jog maju lalu mundur |
-
-Setelan sudut dan pembalik arah motor disimpan di memori flash, jadi tidak
-hilang saat robot dimatikan.
-
-## Diagnosa
-
-Halaman `/debug` menampilkan jitter pulsa, presisi gerakan, status motor
-penggerak, dan log terakhir. Endpoint yang tersedia:
-
-| Alamat | Isi |
-|---|---|
-| `/debug` | halaman diagnosa |
-| `/debug/json` | seluruh status dalam JSON |
-| `/debug/log` | log teks |
-| `/debug/download` | unduh laporan lengkap sebagai file |
-| `/debug/reset` | nolkan statistik |
-
-Karena tidak ada sensor posisi, **posisi tutup dihitung dari jumlah pulsa
-yang dikirim ke driver, bukan dari pengukuran**. Motor yang kehilangan
-langkah tetap terbaca sesuai target walaupun tutup belum sampai. Panel
-"Presisi Gerakan" di `/debug` ada untuk menunjukkan berapa sering hal itu
-terjadi.
-
-Untuk merekam log dari HP tanpa laptop:
+### Capturing a diagnostic log without a laptop
 
 ```powershell
-python ambil-log.py --detik 60 --catatan "buka tutup 10 kali"
+python ambil-log.py --detik 60 --catatan "open close 10 kali"
 ```
 
-## Catatan penting
+There is also `cek-stepper.cmd`, a USB-only stepper check that needs neither WiFi
+nor Bluetooth.
 
-Laporan hasil diagnosa hanya sah kalau pengujian dijalankan dengan
-**baterai motor hidup**, karena buck 5V butuh daya dari baterai untuk
-memberi tegangan ke sisi positif TB6600. Kalau robot hanya diberi daya
-dari laptop, sinyal ke driver tidak punya tegangan dan hasil pengujian
-tidak menggambarkan kondisi sebenarnya.
+## Two things worth knowing
 
-Selama proses pengembangan, pengujian dari laptop dilakukan dengan baterai
-motor dimatikan sengaja, untuk mencegah arus balik. Karena itu jangan
-menarik kesimpulan tentang perangkat keras dari pengujian seperti itu.
+**Position is counted, not measured.** There is no position sensor. The firmware
+counts the pulses it sends to the driver, so a stepper that skips a step stays
+invisible to it: it reports the target angle either way. The "Movement Precision"
+panel on `/debug` exists to show how often that happens.
 
-## Struktur berkas
+**Test with full power.** The diagnostics only mean something when the motor
+battery is on, because the 5 V buck needs it to feed the TB6600 inputs. Testing
+from a laptop with the motor battery off means the driver gets no signal, and
+nothing measured that way says anything about the hardware. During development the
+battery was deliberately kept off to avoid back-feed, so do not draw hardware
+conclusions from tests run that way.
+
+## Files
 
 ```
-.
-|-- SmartTrashbin-WiFi.ino    firmware utama
-|-- controller-wifi.html      antarmuka kontrol, sunting berkas ini
-|-- controller-ble.html       antarmuka Bluetooth cadangan
-|-- web_ui.h                  hasil generate dari controller-wifi.html
-|-- konversi-html.py          pembuat web_ui.h
-|-- ambil-log.py              perekam log dari HP
-|-- docs/                     dokumentasi dan catatan perbaikan
-|-- _lama/                    berkas versi lama sebagai cadangan
+SmartTrashbin.ino        firmware
+controller-wifi.html     control panel, edit this
+debug-page.html          diagnostics page, edit this
+setting-page.html        settings page, edit this
+web_ui.h                 generated
+debug_ui.h               generated
+setting_ui.h             generated
+konversi-html.py         builds the three headers from the HTML
+ambil-log.py             records a log over WiFi
+cek-stepper.py/.cmd      USB-only stepper check
+controller-ble.html      Bluetooth control UI
+HARDWARE.md              wiring, pinout, fault reference
 ```
 
-## Lisensi
+## License
 
-Belum ditentukan.
+Not decided yet.
