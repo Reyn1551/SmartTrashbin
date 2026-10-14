@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="id"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Setelan SmartTrashbin</title>
+<style>
+:root{--bg:#0c1015;--pan:#141a22;--fg:#e6edf3;--dim:#8b98a8;--acc:#4ea8ff;
+--bd:#212c38;--ok:#4ad07a;--warn:#ffc857;--er:#ff6b6b}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+padding:14px 14px 40px;max-width:620px;margin:0 auto}
+h1{font-size:19px;margin:0 0 3px}
+.sub{color:var(--dim);font-size:12.5px;margin-bottom:16px}
+.card{background:var(--pan);border:1px solid var(--bd);border-radius:11px;
+padding:14px;margin-bottom:12px}
+.card h2{font-size:11.5px;margin:0 0 11px;color:var(--dim);
+text-transform:uppercase;letter-spacing:1px;font-weight:600}
+.ket{color:var(--dim);font-size:12px;margin:0 0 11px}
+.row{display:flex;justify-content:space-between;align-items:center;
+gap:10px;padding:7px 0;border-bottom:1px solid #1b232d}
+.row:last-child{border:0}
+.row .label{font-size:13.5px}
+.row .hint{color:var(--dim);font-size:11.5px;display:block;margin-top:2px}
+.nilai{font-weight:700;color:var(--acc);font-size:14px}
+.pil{display:flex;gap:7px;flex-wrap:wrap}
+button{font:inherit;font-size:13px;padding:8px 13px;border-radius:8px;
+background:#1e2833;color:var(--fg);border:1px solid var(--bd);
+cursor:pointer;touch-action:manipulation}
+button:active{background:var(--acc);color:#04121f}
+button.pilih{background:#2d4a6b;border-color:#4a7ab5;color:#cfe3ff;
+font-weight:700}
+input[type=number]{font:inherit;width:82px;padding:7px 9px;border-radius:8px;
+background:#0e141b;color:var(--fg);border:1px solid var(--bd);text-align:center}
+input[type=range]{width:100%;margin:7px 0 0;accent-color:var(--acc)}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.er{color:var(--er)}
+.dimc{color:var(--dim)}
+.tab{display:flex;gap:7px;margin-bottom:15px}
+.tab a{flex:1;text-align:center;padding:9px;border-radius:9px;font-size:13px;
+background:#1a222c;color:var(--dim);text-decoration:none;
+border:1px solid var(--bd)}
+.tab a.aktif{background:var(--acc);color:#04121f;font-weight:700}
+.kaki{color:var(--dim);font-size:11.5px;text-align:center;margin-top:18px}
+</style></head><body>
+
+<h1>Setelan</h1>
+<div class="sub">Atur robot tanpa menggerakkannya</div>
+
+<div class="tab">
+  <a href="/">Kontrol</a>
+  <a href="/setting" class="aktif">Setelan</a>
+  <a href="/debug">Diagnosa</a>
+</div>
+
+<!-- ============ KECEPATAN RODA ============ -->
+<div class="card">
+  <h2>Kecepatan Roda</h2>
+  <p class="ket">Hanya mengatur motor penggerak. Tutup tidak terpengaruh.</p>
+
+  <div class="pil" id="profilPil">
+    <button onclick="setProfil(0)" id="pb0">SLOW</button>
+    <button onclick="setProfil(1)" id="pb1">MEDIUM</button>
+    <button onclick="setProfil(2)" id="pb2">FAST</button>
+  </div>
+
+  <div class="row" style="margin-top:11px">
+    <span class="label">Roda berputar<span class="hint" id="hintRoda">-</span></span>
+    <span class="nilai" id="valRoda">-</span>
+  </div>
+
+  <p class="ket" style="margin:11px 0 0" id="ketProfil">-</p>
+</div>
+
+<!-- ============ KECEPATAN TUTUP (STEPPER) ============ -->
+<div class="card">
+  <h2>Kecepatan Tutup</h2>
+  <p class="ket">Kecepatan tutup saat membuka dan menutup.</p>
+
+  <div class="row">
+    <span class="label">Kecepatan sekarang</span>
+    <span class="nilai" id="valTutup">-</span>
+  </div>
+
+  <div class="row">
+    <span class="label">Atur
+      <span class="hint">20 sampai 4000 step per detik</span></span>
+    <span>
+      <input type="number" id="spsKustom" min="50" max="4000" step="10" value="450">
+    </span>
+  </div>
+  <button class="aksi" onclick="pakaiSps()">Pakai kecepatan ini</button>
+
+  <div class="pil" style="margin-top:9px">
+    <button onclick="setSps(200)">200</button>
+    <button onclick="setSps(450)">450</button>
+    <button onclick="setSps(800)">800</button>
+    <button onclick="setSps(1200)">1200</button>
+  </div>
+
+  <p class="ket">Pada microstep 1/8, 450 step per detik = tutup bergerak
+  sekitar 100 derajat per detik.</p>
+</div>
+
+<div class="card">
+  <h2>Bukaan Tutup</h2>
+  <p class="ket">Sudut ini dipakai setiap kali tutup dibuka.</p>
+
+  <div class="pil" id="sudutPil">
+    <button onclick="setSudut(30)">30&deg;</button>
+    <button onclick="setSudut(45)">45&deg;</button>
+    <button onclick="setSudut(60)">60&deg;</button>
+    <button onclick="setSudut(90)">90&deg;</button>
+    <button onclick="setSudut(120)">120&deg;</button>
+  </div>
+
+  <div class="row" style="margin-top:11px">
+    <span class="label">Sudut lain</span>
+    <span>
+      <input type="number" id="sudutKustom" min="1" max="120" step="1" value="90">
+      <button onclick="pakaiSudutKustom()">Simpan</button>
+    </span>
+  </div>
+
+  <div class="row">
+    <span class="label">Sudut aktif</span>
+    <span class="nilai" id="valSudut">-</span>
+  </div>
+</div>
+
+<!-- ============ ARAH MOTOR ============ -->
+<div class="card">
+  <h2>Arah Motor Roda</h2>
+  <p class="ket">Robot bergerak terbalik dari tombolnya? Balik arahnya di sini.</p>
+
+  <div class="row">
+    <span class="label">Motor kiri</span>
+    <span>
+      <button onclick="setArah('L',1)" id="bl1">Balik</button>
+      <button onclick="setArah('L',0)" id="bl0">Normal</button>
+    </span>
+  </div>
+  <div class="row">
+    <span class="label">Motor kanan</span>
+    <span>
+      <button onclick="setArah('R',1)" id="br1">Balik</button>
+      <button onclick="setArah('R',0)" id="br0">Normal</button>
+    </span>
+  </div>
+
+  <div class="pil" style="margin-top:11px">
+    <button onclick="c('F')" style="flex:1">Uji MAJU</button>
+    <button onclick="c('P')" style="flex:1">STOP</button>
+  </div>
+  <p class="ket" style="margin:9px 0 0">Tekan Uji MAJU sebentar saja.</p>
+</div>
+
+<!-- ============ BELOK ============ -->
+<div class="card">
+  <h2>Belok di Tempat</h2>
+  <p class="ket">Naikkan kalau ada roda yang seperti tidak jalan saat berbelok.</p>
+
+  <div class="row">
+    <span class="label">Tenaga tambahan saat belok
+      <span class="hint" id="hintBelok">-</span></span>
+    <span class="nilai" id="valBelok">-</span>
+  </div>
+  <input type="range" id="belok" min="0" max="90" value="45">
+  <div class="pil" style="margin-top:9px">
+    <button onclick="setBelok(0)">0</button>
+    <button onclick="setBelok(30)">30</button>
+    <button onclick="setBelok(45)">45</button>
+    <button onclick="setBelok(70)">70</button>
+    <button onclick="setBelok(90)">90</button>
+  </div>
+
+  <div class="row" style="margin-top:13px">
+    <span class="label">Uji putar<span class="hint">Tekan dan tahan</span></span>
+    <span>
+      <button id="bputarL" onmousedown="putar('L')" onmouseup="stopRoda()"
+        ontouchstart="putar('L')" ontouchend="stopRoda()">&#9664; KIRI</button>
+      <button id="bputarR" onmousedown="putar('R')" onmouseup="stopRoda()"
+        ontouchstart="putar('R')" ontouchend="stopRoda()">KANAN &#9654;</button>
+    </span>
+  </div>
+</div>
+
+<!-- ============ KESEIMBANGAN RODA ============ -->
+<div class="card">
+  <h2>Keseimbangan Roda</h2>
+  <p class="ket">Robot tidak lurus saat maju? Naikkan angka roda yang lemah.</p>
+
+  <div class="row">
+    <span class="label">Kompensasi roda kiri
+      <span class="hint" id="hintKL">-</span></span>
+    <span class="nilai" id="valKL">-</span>
+  </div>
+  <input type="range" id="kl" min="-60" max="60" value="0">
+  <div class="pil" style="margin-top:7px">
+    <button onclick="setKomp('L',-20)">-20</button>
+    <button onclick="setKomp('L',-10)">-10</button>
+    <button onclick="setKomp('L',0)">0</button>
+    <button onclick="setKomp('L',10)">+10</button>
+    <button onclick="setKomp('L',20)">+20</button>
+  </div>
+
+  <div class="row" style="margin-top:13px">
+    <span class="label">Kompensasi roda kanan
+      <span class="hint" id="hintKR">-</span></span>
+    <span class="nilai" id="valKR">-</span>
+  </div>
+  <input type="range" id="kr" min="-60" max="60" value="0">
+  <div class="pil" style="margin-top:7px">
+    <button onclick="setKomp('R',-20)">-20</button>
+    <button onclick="setKomp('R',-10)">-10</button>
+    <button onclick="setKomp('R',0)">0</button>
+    <button onclick="setKomp('R',10)">+10</button>
+    <button onclick="setKomp('R',20)">+20</button>
+  </div>
+
+  <div class="pil" style="margin-top:13px">
+    <button onclick="c('F')" style="flex:1">Uji MAJU</button>
+    <button onclick="stopRoda()" style="flex:1">STOP</button>
+  </div>
+
+  <div class="row" style="margin-top:11px">
+    <span class="label">PWM akhir tiap roda</span>
+    <span class="nilai" id="valAkhir">-</span>
+  </div>
+</div>
+
+<!-- ============ MODE TAHAN ============ -->
+<div class="card">
+  <h2>Mode Tahan Tutup</h2>
+  <p class="ket">Motor tutup terus diberi arus supaya tutup tidak turun
+  sendiri. Motor jadi hangat dan baterai lebih cepat habis.</p>
+
+  <div class="row">
+    <span class="label">Tahan tutup</span>
+    <span>
+      <button onclick="setTahan(1)" id="bh1">Aktif</button>
+      <button onclick="setTahan(0)" id="bh0">Mati</button>
+    </span>
+  </div>
+</div>
+
+<!-- ============ SISTEM ============ -->
+<div class="card">
+  <h2>Sistem</h2>
+  <div class="row"><span class="label">Kecepatan roda langsung</span>
+    <span class="nilai"><span id="valPwm">-</span></span></div>
+  <input type="range" id="pwm" min="0" max="255" value="165">
+  <p class="ket" style="margin:8px 0 0">Mengubah kecepatan roda saja.</p>
+
+  <div class="row" style="margin-top:12px">
+    <span class="label">Nolkan posisi tutup</span>
+    <button onclick="c('A')">Kalibrasi 0&deg;</button>
+  </div>
+
+  <div class="row">
+    <span class="label">Jalankan ulang robot</span>
+    <button onclick="reboot()">Muat Ulang</button>
+  </div>
+
+  <div class="row">
+    <span class="label">Status</span>
+    <span class="nilai" id="valStatus">-</span>
+  </div>
+
+  <!-- Pengingat setelan microstep. Kalau DIP switch TB6600 diubah
+       tanpa mengubah firmware, semua sudut jadi salah, jadi nilai
+       yang berlaku ditampilkan di sini supaya mudah dicocokkan. -->
+  <div class="row">
+    <span class="label">Microstep firmware
+      <span class="hint">harus sama dengan DIP switch SW1-SW3</span></span>
+    <span class="nilai" id="valMicro">-</span>
+  </div>
+</div>
+
+<div class="kaki">
+  Setelan tersimpan di memori robot dan tetap ada setelah dimatikan.<br>
+  <span id="pesan">-</span>
+</div>
+
+<script>
+var $ = function(i){ return document.getElementById(i); };
+var bawaTimer = null;
+
+function pesan(t, jenis){
+  var el = $('pesan');
+  el.textContent = t;
+  el.className = jenis || 'dimc';
+  if (bawaTimer) clearTimeout(bawaTimer);
+  bawaTimer = setTimeout(function(){ el.textContent = '-';
+    el.className = 'dimc'; }, 2500);
+}
+
+/* Kirim perintah ke firmware */
+function c(v){
+  fetch('/cmd?val=' + encodeURIComponent(v), {cache:'no-store'})
+    .then(function(r){ if (!r.ok) throw 0; return r.text(); })
+    .then(function(){ muat(); })
+    .catch(function(){ pesan('Robot tidak merespons', 'er'); });
+}
+
+/* Ketiga fungsi di bawah ini mengubah setelan, jadi selalu beri tahu
+   pengguna bahwa setelannya sudah tersimpan. */
+function setProfil(p){
+  c('N' + p);
+  var n = ['SLOW', 'MEDIUM', 'FAST'][p] || '?';
+  pesan('Kecepatan roda: ' + n, 'ok');
+}
+
+function setSudut(d){
+  d = Math.max(1, Math.min(120, d));
+  c('W' + d);
+  pesan('Sudut bukaan: ' + d + '\u00B0', 'ok');
+}
+
+function pakaiSudutKustom(){
+  var d = parseFloat($('sudutKustom').value);
+  if (isNaN(d)) { pesan('Angka tidak valid', 'er'); return; }
+  d = Math.max(1, Math.min(120, d));
+  $('sudutKustom').value = d;
+  setSudut(d);
+}
+
+/* Kecepatan tutup diatur TERPISAH dari kecepatan roda, karena
+   stepper bersifat independen. Perintah K hanya menyentuh stepper. */
+function setSps(v){
+  v = Math.round(v);
+  if (v < 50)   v = 50;
+  if (v > 4000) v = 4000;
+  $('spsKustom').value = v;
+  c('K' + v);
+  pesan('Kecepatan tutup: ' + v + ' step/detik', 'ok');
+}
+
+function pakaiSps(){
+  var v = parseInt($('spsKustom').value, 10);
+  if (isNaN(v)){ pesan('Isi angka dulu', 'err'); return; }
+  setSps(v);
+}
+
+function setArah(sisi, balik){
+  c('Y' + sisi + balik);
+  pesan('Motor ' + (sisi === 'L' ? 'kiri' : 'kanan') + ': ' +
+        (balik ? 'DIBALIK' : 'normal'), 'ok');
+}
+
+function setTahan(on){
+  c('H' + on);
+  pesan('Mode tahan: ' + (on ? 'AKTIF' : 'mati'), 'ok');
+}
+
+function reboot(){
+  if (!confirm('Jalankan ulang robot? Posisi tutup akan dianggap 0 derajat.')) return;
+  fetch('/debug/reset', {cache:'no-store'}).catch(function(){});
+  pesan('Robot dijalankan ulang', 'ok');
+}
+
+/* Slider PWM mengubah kecepatan roda saja */
+var slider = $('pwm');
+slider.addEventListener('input', function(){ $('valPwm').textContent = slider.value; });
+slider.addEventListener('change', function(){ c('V' + slider.value); });
+$('valPwm').textContent = slider.value;
+
+/* Tandai tombol yang sedang aktif supaya pengguna tahu setelan mana
+   yang berlaku sekarang. */
+function tandai(id, aktif){
+  var el = $(id);
+  if (!el) return;
+  el.className = aktif ? 'pilih' : '';
+}
+
+/* Penjelasan tiap profil. Hanya menyangkut RODA, karena profil tidak
+   mengatur tutup sama sekali. */
+var KET = [
+  'Pelan dan mudah dikendalikan. Paling hemat baterai. Cocok untuk mengemudi di ruang sempit atau saat membawa beban berat.',
+  'Seimbang. Cocok dipakai sehari-hari.',
+  'Paling cepat. Pakai di tempat terbuka dengan lantai rata. Pada kecepatan ini torsi roda paling kecil, jadi robot lebih mudah selip saat mulai berjalan.'
+];
+
+var RODA_KET = [ 'pelan', 'sedang', 'kencang' ];
+
+/* ---------- BELOK DI TEMPAT ---------- */
+
+var putarTimer = null;
+
+/* Selama tombol putar ditahan, kirim ulang perintahnya supaya roda
+   tidak berhenti sendiri gara-gara pengaman waktu di firmware. */
+function putar(arah){
+  c(arah);
+  if (putarTimer) clearInterval(putarTimer);
+  putarTimer = setInterval(function(){ c(arah); }, 1500);
+}
+
+function stopRoda(){
+  if (putarTimer) { clearInterval(putarTimer); putarTimer = null; }
+  c('P');
+}
+
+function setBelok(v){
+  c('ZB' + v);
+  pesan('Tenaga belok: +' + v, 'ok');
+}
+
+/* ---------- KESEIMBANGAN RODA ---------- */
+
+function setKomp(sisi, v){
+  c('Z' + sisi + v);
+  pesan('Kompensasi ' + (sisi === 'L' ? 'kiri' : 'kanan') +
+        ': ' + (v > 0 ? '+' : '') + v, 'ok');
+}
+
+var sliderBelok = $('belok');
+var sliderKL = $('kl');
+var sliderKR = $('kr');
+
+/* Saat slider digeser, tampilkan angkanya saja. Perintah baru
+   dikirim ketika jari diangkat, supaya tidak membanjiri robot
+   dengan puluhan perintah. */
+sliderBelok.addEventListener('input',
+  function(){ $('valBelok').textContent = '+' + sliderBelok.value; });
+sliderBelok.addEventListener('change',
+  function(){ setBelok(sliderBelok.value); });
+
+sliderKL.addEventListener('input',
+  function(){ $('valKL').textContent = tanda(sliderKL.value); });
+sliderKL.addEventListener('change',
+  function(){ setKomp('L', sliderKL.value); });
+
+sliderKR.addEventListener('input',
+  function(){ $('valKR').textContent = tanda(sliderKR.value); });
+sliderKR.addEventListener('change',
+  function(){ setKomp('R', sliderKR.value); });
+
+function tanda(v){
+  v = parseInt(v, 10);
+  return (v > 0 ? '+' : '') + v;
+}
+
+/* ---------- KUMPULKAN STATUS ---------- */
+
+function muat(){
+  fetch('/status', {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(s){
+      var p = (typeof s.profil === 'number') ? s.profil : 1;
+
+      for (var i = 0; i < 3; i++) tandai('pb' + i, i === p);
+
+      $('hintRoda').textContent  = RODA_KET[p] || '';
+      $('ketProfil').textContent = KET[p] || '';
+
+      /* Kecepatan tutup ditampilkan dari nilai stepper yang berlaku,
+         bukan dari profil roda, karena keduanya terpisah. */
+      $('valTutup').textContent = (s.sp || 0) + ' step/detik';
+      $('valRoda').textContent  = (s.pwm || 0) + ' PWM';
+
+      /* Selaraskan kotak angka kecepatan tutup dengan nilai di
+         firmware, supaya tidak menampilkan angka lama. */
+      if (typeof s.sp === 'number' && document.activeElement !== $('spsKustom')){
+        $('spsKustom').value = Math.round(s.sp);
+      }
+
+      if (typeof s.lidAngle === 'number'){
+        var d = Math.round(s.lidAngle);
+        $('valSudut').textContent = d + '\u00B0';
+        $('sudutKustom').value = d;
+        ['30','45','60','90','120'].forEach(function(v){
+          var btn = document.querySelector('#sudutPil button[onclick*="setSudut('+v+')"]');
+          if (btn) btn.className = (parseInt(v,10) === d) ? 'pilih' : '';
+        });
+      }
+
+      $('bl1').className = s.balikL ? 'pilih' : '';
+      $('bl0').className = s.balikL ? '' : 'pilih';
+      $('br1').className = s.balikR ? 'pilih' : '';
+      $('br0').className = s.balikR ? '' : 'pilih';
+
+      $('bh1').className = s.holdMode ? 'pilih' : '';
+      $('bh0').className = s.holdMode ? '' : 'pilih';
+
+      /* Setelan roda: baca dari robot, jangan disimpan di halaman.
+         Supaya kalau dibuka dari HP lain tampilannya tetap benar. */
+      if (typeof s.belok === 'number'){
+        sliderBelok.value = s.belok;
+        $('valBelok').textContent = '+' + s.belok;
+        $('hintBelok').textContent = s.belok < 20
+          ? 'masih rendah, roda bisa tersendat saat berbelok'
+          : (s.belok > 70 ? 'tinggi, hati-hati arus driver'
+                          : 'nilai yang wajar');
+      }
+
+      if (typeof s.kompKiri === 'number'){
+        sliderKL.value = s.kompKiri;
+        $('valKL').textContent = tanda(s.kompKiri);
+        $('hintKL').textContent = s.kompKiri === 0
+          ? 'tidak ada kompensasi' : 'roda kiri diberi PWM lebih tinggi';
+      }
+
+      if (typeof s.kompKanan === 'number'){
+        sliderKR.value = s.kompKanan;
+        $('valKR').textContent = tanda(s.kompKanan);
+        $('hintKR').textContent = s.kompKanan === 0
+          ? 'tidak ada kompensasi' : 'roda kanan diberi PWM lebih tinggi';
+      }
+
+      if (typeof s.pwmKiri === 'number'){
+        $('valAkhir').textContent = s.pwmKiri + ' / ' + s.pwmKanan;
+      }
+
+      /* Tampilkan setelan microstep yang dipakai firmware. Cocokkan
+         dengan DIP switch SW1-SW3 di modul TB6600. */
+      if (typeof s.stepsPerDeg === 'number'){
+        var bagi;
+        if (s.stepsPerDeg < 0.8)      bagi = '1/1';
+        else if (s.stepsPerDeg < 1.8) bagi = '1/2';
+        else if (s.stepsPerDeg < 3.4) bagi = '1/4';
+        else if (s.stepsPerDeg < 6.6) bagi = '1/8';
+        else if (s.stepsPerDeg < 13)  bagi = '1/16';
+        else                          bagi = '1/32';
+
+        $('valMicro').textContent = bagi + ' (' +
+          Math.round(s.stepsPerDeg * 360) + ' pulsa/putaran)';
+      }
+
+      if (document.activeElement !== slider){
+        slider.value = s.pwm || 0;
+        $('valPwm').textContent = slider.value;
+      }
+
+      $('valStatus').textContent = 'terhubung';
+      $('valStatus').className = 'nilai ok';
+    })
+    .catch(function(){
+      $('valStatus').textContent = 'tidak terhubung';
+      $('valStatus').className = 'nilai er';
+    });
+}
+
+muat();
+setInterval(muat, 2000);
+</script>
+</body></html>
