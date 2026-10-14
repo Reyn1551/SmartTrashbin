@@ -57,8 +57,24 @@ Sent over HTTP (`/cmd?val=X`), Bluetooth, or serial at 115200 baud.
 | `W<angle>` | set the opening angle |
 | `A` | calibrate: current position is 0° |
 | `K<sps>` | stepper speed in steps per second |
+| `XD<n>` | microstep the firmware assumes: `XD1` `XD2` `XD4` `XD8` `XD16` |
 
-Angle and motor-direction settings go to flash and survive a power cut.
+Angle, motor-direction and microstep settings go to flash and survive a power cut.
+
+## Microstep setting
+
+The lid's microstep is set by **physical DIP switches on the TB6600** — firmware
+cannot change it. What you can set is which one the firmware *assumes*, so
+switching the DIP switches no longer means editing code and re-uploading.
+
+Set it from the **Microstep Tutup** card on `/setting`, or with `XD<n>`. The
+firmware keeps the reported lid angle and rescales the step speed, so the lid
+moves at the same physical speed across the change.
+
+Pick a lower microstep (1/4, 1/2) if the lid skips or stalls under load, since
+torque per step goes up. Pick a higher one (1/16) for quieter, smoother movement,
+and watch for lost steps. 1/8 is the default and the only value verified on this
+robot; HARDWARE.md section 4 has the DIP tables.
 
 ## Build and upload
 

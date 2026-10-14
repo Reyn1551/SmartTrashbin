@@ -123,34 +123,50 @@ void addLogf(const char* fmt, ...) {
 }
 
 // ==================== STEPPER CONSTANTS ====================
-// !!! NEVER CHANGE THESE WITHOUT MATCHING THE DIP SWITCHES !!!
-// Must match the TB6600 microstep setting, else angles are silently wrong:
-// firmware reports "90 deg" while the lid moves 45 or 180.
-//   pulses/rev = 200 x divisor ; STEPS_PER_DEG = REV / 360
-//   1/1 200 | 1/2 400 | 1/4 800 | 1/8 1600 <-- NOW | 1/16 3200 | 1/32 6400
+// The TB6600's microstep is set by PHYSICAL DIP switches (SW1/SW2/SW3); firmware
+// cannot change it. What these variables hold is the microstep the firmware
+// ASSUMES, so it can be told which DIP setting is in use without a recompile.
+//   pulses/rev = 200 x divisor ; stepsPerDeg = pulses/rev / 360
+//   1/1 200 | 1/2 400 | 1/4 800 | 1/8 1600 <-- default | 1/16 3200
 // Device-verified: SW1/2/3 = OFF/ON/OFF -> 1/8; SW4/5/6 = ON/OFF/OFF -> 2.0 A;
 // motor supply 24 V.
-// Why 1/8, and why the old "1/8 stops the stepper" note was wrong: the motor was
-// SILENT, and a stalled stepper always buzzes or vibrates - silence means no coil
-// current, i.e. a current-path fault (cable, supply, ENA) or const mismatch, NOT
-// the microstep level. Real cause: DIP was at 1/8 while the firmware constant
-// stayed 1/16, so every requested angle was wrong.
-// Torque per step: 19.51% at 1/8 vs 9.80% at 1/16; detent torque alone is 5-20%
-// of holding torque, so doubling step torque matters.
-// RULE: on any DIP microstep change update these constants AND DIP_TERAKHIR,
-// then re-upload - else lid angles go silently wrong.
-// Source: Faulhaber App Note 015; see HARDWARE.md section 5.
-const float STEPS_PER_REV = 1600.0;
-const float STEPS_PER_DEG = STEPS_PER_REV / 360.0;   // 4.4444
+//
+// If the assumed microstep does not match the DIP switches, every angle is
+// silently wrong: firmware reports "90 deg" while the lid moves 45 or 180.
+//
+// Why 1/8 is the default, and why the old "1/8 stops the stepper" note was
+// wrong: the motor was SILENT, and a stalled stepper always buzzes or vibrates -
+// silence means no coil current, i.e. a current-path fault (cable, supply, ENA)
+// or a constant mismatch, NOT the microstep level. Real cause: the DIP was at
+// 1/8 while the firmware constant still said 1/16, so every angle was wrong.
+//
+// Torque per step by microstep (share of holding torque, Faulhaber App Note 015):
+//   1/1 100%  |  1/2 70.7%  |  1/4 38.3%  |  1/8 19.5%  |  1/16 9.8%
+// Detent torque alone is 5-20%, so on a heavy lid 1/16 barely moves at all.
+// Lower microstep = more torque per step = a heavier lid moves reliably.
+// Higher microstep = finer resolution = smoother and quieter, but weaker.
+//
+// Changed at runtime by the 'M' command or the setting page. Saved to flash.
+float stepsPerRev = 1600.0;
+float stepsPerDeg = stepsPerRev / 360.0;   // 4.4444 at 1/8
 
-// ------------------------------------------------------------
-//  MICROSTEP MARKER  *** READ BEFORE CHANGING DIP ***
-// ------------------------------------------------------------
-// The microstep firmware ASSUMES. Not used for math - it is COMPARED: stored to
-// flash, and a mismatch at boot means the firmware was uploaded assuming a
-// different microstep, so cached stepper speeds must be discarded.
-// Change ONLY with STEPS_PER_REV.  1/4->4 | 1/8->8 <--now | 1/16->16
-#define DIP_TERAKHIR  8
+// Assumed microstep divisor, as the number people see on the DIP table (1,2,4,
+// 8,16). Kept in step with stepsPerRev by setMicrostep(); the two must never
+// disagree or the angles above break.
+uint8_t microstepDiv = 8;
+
+// The divisors the firmware accepts. 1/32 is deliberately absent: on a real
+// Toshiba TB6600HG that DIP combination is marked NC in the datasheet, so
+// supporting it would invite an undefined mode.
+const uint8_t MICROSTEP_DIVS[]   = { 1, 2, 4, 8, 16 };
+const uint8_t MICROSTEP_JUMLAH   = sizeof(MICROSTEP_DIVS) / sizeof(MICROSTEP_DIVS[0]);
+
+bool microstepDidukung(uint8_t div) {
+  for (uint8_t i = 0; i < MICROSTEP_JUMLAH; i++) {
+    if (MICROSTEP_DIVS[i] == div) return true;
+  }
+  return false;
+}
 
 // ------------------------------------------------------------
 //  GLOBAL LID ANGLE
@@ -863,11 +879,14 @@ void stepperJog(Stepper &s, long steps, int forcedDir, float sps) {
 // If torque is short, in order: raise the TB6600 current (biggest and cheapest
 // win), drop the microstep, raise the motor supply to 24 V, lower the speed.
 //
-// After changing microstepping, STEPS_PER_REV and DIP_TERAKHIR must both change,
-// or every commanded angle is wrong:
-//        4  ->  800.0 / 360.0 = 2.2222
-//        8  -> 1600.0 / 360.0 = 4.4444  (current)
-//       16  -> 3200.0 / 360.0 = 8.8889
+// Microstep is selectable at runtime (command XD<n> or the setting page), which
+// updates stepsPerRev and stepsPerDeg together. The TB6600 DIP switches must be
+// set to match, or every commanded angle is wrong. pulses/rev by divisor:
+//        1  ->   200.0 / 360.0 = 0.5556
+//        2  ->   400.0 / 360.0 = 1.1111
+//        4  ->   800.0 / 360.0 = 2.2222
+//        8  ->  1600.0 / 360.0 = 4.4444  (default)
+//       16  ->  3200.0 / 360.0 = 8.8889
 //
 // Since firmware cannot change torque, this test MEASURES the speed at which the
 // motor starts losing steps. That gives the safe limit and shows whether the
@@ -990,11 +1009,11 @@ void sweepKecepatan(Stepper &s, const char* nama) {
                            1200, 1400, 1600, 1800, 2000 };
   const uint8_t jumlah = sizeof(daftar) / sizeof(daftar[0]);
 
-  // 800 steps, written as 180 degrees times STEPS_PER_DEG so it follows a
+  // 800 steps, written as 180 degrees times stepsPerDeg so it follows a
   // microstep change: 800 steps at 1/8 (180 degrees), 1600 at 1/16. Long enough
   // to reach full speed, short enough to run many stages without hitting
   // anything.
-  const long LANGKAH = (long)lroundf(180.0f * STEPS_PER_DEG);
+  const long LANGKAH = (long)lroundf(180.0f * stepsPerDeg);
 
   sweepJumlahTahap  = 0;
   sweepTotalMeleset = 0;
@@ -1003,7 +1022,7 @@ void sweepKecepatan(Stepper &s, const char* nama) {
 
   addLogf("[SWEEP] ===== MULAI ===== lid %s", nama);
   addLogf("[SWEEP] %u tahap, %ld langkah tiap tahap (%.0f derajat)",
-          (unsigned)jumlah, LANGKAH, (float)LANGKAH / STEPS_PER_DEG);
+          (unsigned)jumlah, LANGKAH, (float)LANGKAH / stepsPerDeg);
 
   uint8_t gagalBerturut = 0;
 
@@ -1551,7 +1570,7 @@ void stepperDirTest(Stepper &s, const char* nama) {
 
 void stepperMoveToDeg(Stepper &s, float deg, float speedSps) {  if (speedSps < 50.0) speedSps = 50.0;
 
-  s.targetStep   = lroundf(deg * STEPS_PER_DEG);
+  s.targetStep   = lroundf(deg * stepsPerDeg);
 
   long delta     = s.targetStep - s.currentStep;
 
@@ -1935,7 +1954,7 @@ void stepperTaskCore1(void* param) {
         //
         // IMPORTANT: this guard uses TIME, not a loop-iteration count. It used
         // a fixed count (> 3000000), which was wrong because that time limit
-        // shifted whenever STEPS_PER_REV (microstep) changed. Real case: after
+        // shifted whenever stepsPerRev (microstep) changed. Real case: after
         // the microstep change to 1/8, test command E400 (=90 degrees) at 100
         // step/s needs 4.0 s, and the old counter cut it at ~3 s, stopping at
         // 389 of 400 pulses and printing "[ERROR] Stepper >3s" -- although the
@@ -1981,7 +2000,7 @@ void stepperTaskCore1(void* param) {
                     "(%.2f derajat)",
                     (long)selisih,
                     (unsigned long)gMoveReqSteps,
-                    (float)selisih / STEPS_PER_DEG);
+                    (float)selisih / stepsPerDeg);
           } else {
             addLogf("[PRESISI] tepat %lu langkah - presisi",
                     (unsigned long)gMoveReqSteps);
@@ -2167,12 +2186,88 @@ void simpanProfil() {
   if (!p.begin("trashbin", false)) return;
   p.putUChar("profil",  profilAktif);
   p.putFloat("stepSps", stepSpeedActive);
-  // Also write the microstep marker: the stored speed is only valid for the
-  // microstep the firmware currently uses, so both must be saved together.
-  // Without this marker the next boot would assume the speed came from a
-  // different microstep and discard it.
-  p.putUChar("dipMicro", DIP_TERAKHIR);
+  // The stored speed is only valid for the microstep it was computed at, so the
+  // divisor is saved alongside it. Without this the next boot could not tell an
+  // old 1/16 speed from a current one.
+  p.putUChar("dipMicro", microstepDiv);
   p.end();
+}
+
+// ------------------------------------------------------------
+//  MICROSTEP SELECTION
+// ------------------------------------------------------------
+// Sets the microstep the firmware ASSUMES and recomputes stepsPerDeg. The DIP
+// switches on the TB6600 must already be set to match; this only tells the
+// firmware what they say, which is why the UI asks you to confirm.
+//
+// Refused while a lid is moving: the speed and target of an in-flight move were
+// computed at the old steps-per-degree, so changing it mid-move would send the
+// lid to the wrong angle.
+//
+// Step speed is rescaled by the same ratio, so the lid keeps moving at the same
+// physical speed: at 1/16 the pulse count per degree doubles, so the pulses per
+// second must double too. Without this, switching from 1/8 to 1/16 would make
+// every move run at half speed and possibly stall.
+bool setMicrostep(uint8_t div, bool simpan) {
+  if (!microstepDidukung(div)) {
+    addLogf("[STEP] Microstep 1/%u tidak didukung (1,2,4,8,16 saja)", (unsigned)div);
+    return false;
+  }
+
+  if (stepperBusy()) {
+    addLog("[STEP] Tidak bisa ganti microstep saat lid bergerak. Tunggu selesai.");
+    return false;
+  }
+
+  if (div == microstepDiv) {
+    if (simpan) simpanProfil();
+    return true;
+  }
+
+  // Rescale the active speed so the physical lid speed is unchanged.
+  float rasio = (float)div / (float)microstepDiv;
+
+  // currentStep is a raw step COUNT, so the same count means a different ANGLE
+  // once stepsPerDeg changes: 400 steps is 90 deg at 1/8 but 45 deg at 1/16.
+  // Capture the angles now, while the old stepsPerDeg is still in effect, so the
+  // counts can be rebuilt afterwards and the reported position stays continuous.
+  float degL = stLidLeft.currentStep  / stepsPerDeg;
+  float degR = stLidRight.currentStep / stepsPerDeg;
+
+  microstepDiv = div;
+  stepsPerRev  = 200.0f * (float)div;
+  stepsPerDeg  = stepsPerRev / 360.0f;
+
+  stLidLeft.currentStep  = lroundf(degL * stepsPerDeg);
+  stLidRight.currentStep = lroundf(degR * stepsPerDeg);
+  stLidLeft.targetStep   = stLidLeft.currentStep;
+  stLidRight.targetStep  = stLidRight.currentStep;
+
+  float spsBaru = stepSpeedActive * rasio;
+  float spsLama = stepSpeedActive;
+
+  // Tell the truth when the guardrail bites. Preserving lid speed exactly is
+  // impossible at the extremes: 450 step/s at 1/1 is already ~810 deg/s, and
+  // scaling that to 1/16 would need 28 step/s, below the 50 that keeps a stepper
+  // turning at all. Clamping is correct here, but the speed then really does
+  // change, so it is reported rather than hidden.
+  bool dijepit = false;
+  if (spsBaru < 50.0f)   { spsBaru = 50.0f;   dijepit = true; }
+  if (spsBaru > 4000.0f) { spsBaru = 4000.0f; dijepit = true; }
+  stepSpeedActive = spsBaru;
+
+  addLogf("[STEP] Microstep 1/%u: %.0f pulsa/putaran, 1 derajat = %.4f langkah",
+          (unsigned)div, stepsPerRev, stepsPerDeg);
+  addLogf("[STEP] Kecepatan %.0f -> %.0f step/s", spsLama, stepSpeedActive);
+  if (dijepit) {
+    addLog("[STEP] Kecepatan lid ikut berubah karena batas 50-4000 step/s.");
+    addLog("[STEP] Setel ulang kecepatan kalau terasa terlalu cepat/lambat.");
+  }
+  addLogf("[STEP] Posisi lid tetap %.1f / %.1f derajat", degL, degR);
+  addLog("[STEP] Pastikan DIP SW1/SW2/SW3 di TB6600 sudah disetel ke nilai ini.");
+
+  if (simpan) simpanProfil();
+  return true;
 }
 
 // Old name for simpanMotor(), kept so older code does not all need changing.
@@ -2194,50 +2289,50 @@ void muatProfil() {
   // the wheel profile, and so a value stored before the profile struct
   // changed is still readable.
   //
-  // IMPORTANT: a stored value can come from old settings that no longer fit,
-  // and the magnitude does not always reveal it. Real example: 600 was stored
-  // while the firmware used 1/16 microstep; at 1/8 the same 600 means the lid
-  // moves TWICE as fast. 600 itself still looks plausible (within 50..4000),
-  // so a range check alone cannot catch it. Hence the microstep marker: if
-  // DIP_TERAKHIR differs from the stored value, the firmware was re-uploaded
-  // with a different microstep assumption, and the old speed MUST NOT be
-  // used because it was computed for a different pulses-per-degree.
+  // IMPORTANT: a stored value can come from settings that no longer fit, and the
+  // magnitude does not always reveal it. Real example: 600 was stored while the
+  // firmware used 1/16 microstep; at 1/8 the same 600 means the lid moves TWICE
+  // as fast. 600 itself still looks plausible (within 50..4000), so a range check
+  // alone cannot catch it. Hence the stored divisor: if it differs from the
+  // current one, the saved speed was computed for a different
+  // pulses-per-degree and MUST NOT be used as-is. It is rescaled instead, so the
+  // lid keeps the same physical speed.
   float sps = p.getFloat("stepSps", STEP_DEFAULT_SPS);
 
-  uint8_t dipTersimpan = p.getUChar("dipMicro", 0);
+  uint8_t divTersimpan = p.getUChar("dipMicro", 0);
 
   p.end();
 
   if (v > 2) v = PROFIL_MEDIUM;
   pilihProfil(v, false);
 
-  bool microstepBerubah = (dipTersimpan != DIP_TERAKHIR);
+  // Restore the microstep first, so the speed below is interpreted correctly.
+  // A missing marker (old firmware or fresh flash) keeps the compiled default.
+  bool divValid = microstepDidukung(divTersimpan);
 
-  if (microstepBerubah) {
-    if (dipTersimpan != 0) {
-      // Value stored but from another microstep -> discard.
-      addLogf("[STEP] Microstep berubah (%u -> %u). Kecepatan lama %.0f",
-              (unsigned)dipTersimpan, (unsigned)DIP_TERAKHIR,
-              sps);
-      addLogf("[STEP] dibuang karena dihitung untuk 1/%u, pakai default %.0f",
-              (unsigned)dipTersimpan, STEP_DEFAULT_SPS);
-    } else {
-      // No marker (old firmware / fresh flash): the stored speed cannot be
-      // trusted -> use default.
-      addLogf("[STEP] Belum ada penanda microstep. Kecepatan tersimpan %.0f",
-              sps);
-      addLogf("[STEP] tidak dipakai, pakai default %.0f", STEP_DEFAULT_SPS);
-    }
-    sps = STEP_DEFAULT_SPS;
+  if (divValid && divTersimpan != microstepDiv) {
+    float rasio = (float)divTersimpan / (float)microstepDiv;
+    microstepDiv = divTersimpan;
+    stepsPerRev  = 200.0f * (float)divTersimpan;
+    stepsPerDeg  = stepsPerRev / 360.0f;
 
-    // Store the marker so the next boot does not see a change.
-    Preferences pw;
-    if (pw.begin("trashbin", false)) {
-      pw.putUChar("dipMicro", DIP_TERAKHIR);
-      pw.putFloat("stepSps", sps);
-      pw.end();
-    }
-  } else if (sps < 50.0f || sps > 4000.0f) {
+    float spsBaru = sps * rasio;
+    if (spsBaru < 50.0f)   spsBaru = 50.0f;
+    if (spsBaru > 4000.0f) spsBaru = 4000.0f;
+
+    addLogf("[STEP] Microstep dari memori = 1/%u, kecepatan %.0f -> %.0f step/s",
+            (unsigned)divTersimpan, sps, spsBaru);
+    sps = spsBaru;
+  } else if (!divValid && divTersimpan != 0) {
+    addLogf("[STEP] Microstep tersimpan 1/%u tidak dikenal - pakai 1/%u",
+            (unsigned)divTersimpan, (unsigned)microstepDiv);
+  } else if (divTersimpan == 0) {
+    // No marker: fresh flash or firmware from before this setting existed.
+    addLogf("[STEP] Belum ada microstep tersimpan - pakai default 1/%u",
+            (unsigned)microstepDiv);
+  }
+
+  if (sps < 50.0f || sps > 4000.0f) {
     addLogf("[STEP] Kecepatan tersimpan %.0f tidak masuk akal - pakai default %.0f",
             sps, STEP_DEFAULT_SPS);
     sps = STEP_DEFAULT_SPS;
@@ -2246,8 +2341,8 @@ void muatProfil() {
   stepSpeedActive = sps;
 
   addLogf("[STEP] Kecepatan stepper dari memori = %.0f step/s", stepSpeedActive);
-  addLogf("[STEP] Microstep firmware = 1/%u (%u pulsa/putaran)",
-          (unsigned)DIP_TERAKHIR, (unsigned)STEPS_PER_REV);
+  addLogf("[STEP] Microstep firmware = 1/%u (%.0f pulsa/putaran, 1 derajat = %.4f langkah)",
+          (unsigned)microstepDiv, stepsPerRev, stepsPerDeg);
 }
 
 // ------------------------------------------------------------
@@ -2370,7 +2465,7 @@ void executeCommand(char cmd, const String &arg) {
     // 'E' = slow pin-signal test (no load): separates firmware faults from wiring
     // faults when the stepper never moves. E/EL left, ER right, EB both, E<n>
     // pulses. 100 step/s so movement is visible by eye. Default 400 pulses = 90
-    // deg at 1/8 microstep, tracking STEPS_PER_REV (800 pulses at 1/16).
+    // deg at 1/8 microstep, tracking stepsPerRev (800 pulses at 1/16).
     case 'E': {
       String a = arg;
       a.toUpperCase();
@@ -2578,12 +2673,12 @@ void executeCommand(char cmd, const String &arg) {
                 brownoutSuspect ? "YA" : "tidak",
                 crashSuspect ? "YA" : "tidak");
         addLog("[DIAG] --- KONFIGURASI ---");
-        addLog("[DIAG] Microstep: 1/8 (DIP SW1=OFF SW2=ON SW3=OFF)");
-        addLogf("[DIAG] %u pulsa/putaran (1 derajat = %.4f langkah)",
-                (unsigned)STEPS_PER_REV, STEPS_PER_DEG);
+        addLogf("[DIAG] Microstep diasumsikan 1/%u - cocokkan dengan DIP SW1/SW2/SW3",
+                (unsigned)microstepDiv);
+        addLogf("[DIAG] %.0f pulsa/putaran (1 derajat = %.4f langkah)",
+                stepsPerRev, stepsPerDeg);
         addLog("[DIAG] Arus TB6600 diasumsikan 2.0 A (SW4=ON SW5=OFF SW6=OFF)");
         addLog("[DIAG] Kalau DIP switch berbeda dari di atas, sudut akan SALAH.");
-        addLogf("[DIAG] 1 derajat = %.4f langkah", STEPS_PER_DEG);
         addLogf("[DIAG] Kecepatan stepper aktif = %.0f step/s", stepSpeedActive);
         addLogf("[DIAG] Sudut global (buka) = %.1f derajat", lidAngleGlobal);
         addLog("[DIAG] --- POLARITAS FIRMWARE ---");
@@ -2609,11 +2704,11 @@ void executeCommand(char cmd, const String &arg) {
         addLog("[DIAG] --- POSISI & MOTOR ---");
         addLogf("[DIAG] Lid KIRI : %ld step (%.2f derajat), moving=%s",
                 stLidLeft.currentStep,
-                stLidLeft.currentStep / STEPS_PER_DEG,
+                stLidLeft.currentStep / stepsPerDeg,
                 stLidLeft.moving ? "YA" : "tidak");
         addLogf("[DIAG] Lid KANAN: %ld step (%.2f derajat), moving=%s",
                 stLidRight.currentStep,
-                stLidRight.currentStep / STEPS_PER_DEG,
+                stLidRight.currentStep / stepsPerDeg,
                 stLidRight.moving ? "YA" : "tidak");
         addLogf("[DIAG] Total pulsa keluar sejak boot = %lu",
                 (unsigned long)stepTotal);
@@ -2716,7 +2811,9 @@ void executeCommand(char cmd, const String &arg) {
 
     // 'X' = test switches for hunting long pulse periods. XB1 BLE off (is
     // BLE/flash holding pulses?), XB0 on; XT1 tick only the active motor (spin
-    // loop load), XT0 both.
+    // loop load), XT0 both. Also the microstep selector, XD<n>, where n is the
+    // divisor on the TB6600 DIP switches: XD1/XD2/XD4/XD8/XD16. XD alone reports
+    // the current setting.
     case 'X': {
       String a = arg;
       a.toUpperCase();
@@ -2730,10 +2827,21 @@ void executeCommand(char cmd, const String &arg) {
         addLogf("[UJI] Tick %s",
                 tickHanyaMotorAktif ? "hanya motor aktif"
                                     : "kedua motor");
+      } else if (a.startsWith("D")) {
+        // XD<n>: set the assumed microstep. No argument just reports.
+        if (a.length() > 1) {
+          int div = a.substring(1).toInt();
+          if (div > 0) setMicrostep((uint8_t)div, true);
+          else addLog("[STEP] Argumen XD harus angka, mis. XD8");
+        } else {
+          addLogf("[STEP] Microstep sekarang 1/%u (%.0f pulsa/putaran)",
+                  (unsigned)microstepDiv, stepsPerRev);
+        }
       } else {
-        addLogf("[UJI] BLE=%s  tickHanyaAktif=%s",
+        addLogf("[UJI] BLE=%s  tickHanyaAktif=%s  microstep=1/%u",
                 bleOff ? "mati" : "hidup",
-                tickHanyaMotorAktif ? "ya" : "tidak");
+                tickHanyaMotorAktif ? "ya" : "tidak",
+                (unsigned)microstepDiv);
       }
       break;
     }
@@ -2791,7 +2899,7 @@ void executeCommand(char cmd, const String &arg) {
       if (sisi == 'L' || sisi == 'B') daftar[jumlah++] = &stLidLeft;
       if (sisi == 'R' || sisi == 'B') daftar[jumlah++] = &stLidRight;
       for (int i = 0; i < jumlah; i++) {
-        long targetBaru = lroundf(degTujuan * STEPS_PER_DEG);
+        long targetBaru = lroundf(degTujuan * stepsPerDeg);
         // Already at target means no movement at all, which is what prevents
         // "already closed but still moving".
         if (daftar[i]->currentStep == targetBaru && !daftar[i]->moving) {
@@ -2868,9 +2976,9 @@ void handleStatus() {
            "\"belok\":%d,\"kompKiri\":%d,\"kompKanan\":%d,"
            "\"balikL\":%d,\"balikR\":%d,\"holdMode\":%d,"
            "\"lidAngle\":%.1f,"
-           "\"pwmKiri\":%d,\"pwmKanan\":%d}",
-           stLidLeft.currentStep  / STEPS_PER_DEG,
-           stLidRight.currentStep / STEPS_PER_DEG,
+           "\"microstep\":%d,\"pwmKiri\":%d,\"pwmKanan\":%d}",
+           stLidLeft.currentStep  / stepsPerDeg,
+           stLidRight.currentStep / stepsPerDeg,
            lidAngleGlobal,
            stepperBusy() ? 1 : 0,
            (moveMode == MOVE_STOP) ? "stop" : "run",
@@ -2885,6 +2993,7 @@ void handleStatus() {
            motorBalikKanan ? 1 : 0,
            holdMode ? 1 : 0,
            lidAngleGlobal,
+           (int)microstepDiv,
            (int)motorPwmUntuk(true,  false),
            (int)motorPwmUntuk(false, false));
   server.send(200, "application/json", buf);
@@ -2970,6 +3079,7 @@ void handleDebugJson() {
       "\"sweepN\":%u,"
       "\"sweepGagal\":%u,"
       "\"sweepAman\":%d,"
+      "\"microstep\":%d,"
       "\"stepsPerDeg\":%.4f"
     "}",
     (unsigned long)(millis() / 1000),
@@ -2977,13 +3087,13 @@ void handleDebugJson() {
     (unsigned long)ESP.getMinFreeHeap(),
     (int)WiFi.softAPgetStationNum(),
     (int)WiFi.RSSI(),
-    stLidLeft.currentStep  / STEPS_PER_DEG,
-    stLidLeft.targetStep   / STEPS_PER_DEG,
+    stLidLeft.currentStep  / stepsPerDeg,
+    stLidLeft.targetStep   / stepsPerDeg,
     stLidLeft.moving ? 1 : 0,
     stLidLeft.speedCurrent,
     stLidLeft.enabled ? 1 : 0,
-    stLidRight.currentStep / STEPS_PER_DEG,
-    stLidRight.targetStep  / STEPS_PER_DEG,
+    stLidRight.currentStep / stepsPerDeg,
+    stLidRight.targetStep  / stepsPerDeg,
     stLidRight.moving ? 1 : 0,
     stLidRight.speedCurrent,
     stLidRight.enabled ? 1 : 0,
@@ -3033,7 +3143,8 @@ void handleDebugJson() {
     (unsigned)sweepJumlahTahap,
     (unsigned)sweepTotalMeleset,
     (int)(sweepKecepatanAman * 10.0f),
-    STEPS_PER_DEG);
+    (int)microstepDiv,
+    stepsPerDeg);
   server.send(200, "application/json", buf);
 }
 
@@ -3063,15 +3174,15 @@ String buildLaporan() {
   o += "\n";
   // ---------- STEPPER ----------
   o += "--- STEPPER / LID ---\n";
-  o += "Lid KIRI  posisi  : " + String(stLidLeft.currentStep / STEPS_PER_DEG, 1) +
+  o += "Lid KIRI  posisi  : " + String(stLidLeft.currentStep / stepsPerDeg, 1) +
        " derajat (target " +
-       String(stLidLeft.targetStep / STEPS_PER_DEG, 1) + ")\n";
+       String(stLidLeft.targetStep / stepsPerDeg, 1) + ")\n";
   o += "Lid KIRI  status  : " + String(stLidLeft.moving ? "BERGERAK" : "diam") +
        ", enabled=" + String(stLidLeft.enabled ? 1 : 0) +
        ", step=" + String(stLidLeft.currentStep) + "\n";
-  o += "Lid KANAN posisi  : " + String(stLidRight.currentStep / STEPS_PER_DEG, 1) +
+  o += "Lid KANAN posisi  : " + String(stLidRight.currentStep / stepsPerDeg, 1) +
        " derajat (target " +
-       String(stLidRight.targetStep / STEPS_PER_DEG, 1) + ")\n";
+       String(stLidRight.targetStep / stepsPerDeg, 1) + ")\n";
   o += "Lid KANAN status  : " + String(stLidRight.moving ? "BERGERAK" : "diam") +
        ", enabled=" + String(stLidRight.enabled ? 1 : 0) +
        ", step=" + String(stLidRight.currentStep) + "\n";
@@ -3116,7 +3227,7 @@ String buildLaporan() {
   o += "Gerakan diuji     : " + String(gPresisiUji) + "\n";
   o += "Meleset           : " + String(gPresisiGagal) + "\n";
   o += "Selisih terbesar  : " + String(gPresisiMaksSelisih) + " langkah ("
-       + String(gPresisiMaksSelisih / STEPS_PER_DEG, 3) + " derajat)\n";
+       + String(gPresisiMaksSelisih / stepsPerDeg, 3) + " derajat)\n";
   if (gPresisiUji == 0) {
     o += "[?] Belum ada gerakan yang diuji.\n";
   } else if (gPresisiGagal == 0) {
@@ -3126,7 +3237,7 @@ String buildLaporan() {
     float persen = (float)gPresisiGagal * 100.0f / (float)gPresisiUji;
     o += "[X] " + String(persen, 0) + "% gerakan meleset.\n";
     o += "    Selisih " + String(gPresisiMaksSelisih) +
-         " langkah = " + String(gPresisiMaksSelisih / STEPS_PER_DEG, 3) +
+         " langkah = " + String(gPresisiMaksSelisih / stepsPerDeg, 3) +
          " derajat.\n";
     o += "    Ini KEHILANGAN LANGKAH. Kemungkinan penyebab:\n";
     o += "      1. Arus TB6600 kurang (SW1-SW3, NEMA 17 butuh 1.5-2.0 A)\n";
@@ -3331,8 +3442,8 @@ void sendBleStatus() {
   char buf[200];
   snprintf(buf, sizeof(buf),
            "LL=%.1f;LR=%.1f;LOPEN=%.1f;BL=%d;ST=%s;SP=%d;MV=%d",
-           stLidLeft.currentStep  / STEPS_PER_DEG,
-           stLidRight.currentStep / STEPS_PER_DEG,
+           stLidLeft.currentStep  / stepsPerDeg,
+           stLidRight.currentStep / stepsPerDeg,
            lidAngleGlobal,
            stepperBusy() ? 1 : 0,
            (moveMode == MOVE_STOP) ? "stop" : "run",
@@ -3393,7 +3504,7 @@ void setup() {
   addLog("[OK] Motor DC siap (BTN7970)");
   stepperBegin(stLidLeft);
   stepperBegin(stLidRight);
-  addLogf("[OK] Stepper siap. 1 deg = %.3f step", STEPS_PER_DEG);
+  addLogf("[OK] Stepper siap. 1 deg = %.3f step", stepsPerDeg);
   // ---------- WiFi Access Point ----------
   WiFi.mode(WIFI_AP);
   bool apOk = WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, false, AP_MAX_CONN);

@@ -91,54 +91,99 @@ re-upload in the same session you change the wiring.
 
 ## 4. TB6600 DIP switches
 
-Set on the physical module. The firmware constants must agree with them.
+Set on the physical module. The firmware setting must agree with them.
+
+**Current** (SW4/SW5/SW6), the same for every microstep:
 
 | Setting | DIP | Value |
 |---|---|---|
-| Microstep 1/8 | SW1 OFF, SW2 ON, SW3 OFF | 1600 pulses/rev |
 | Current 2.0 A | SW4 ON, SW5 OFF, SW6 OFF | For a NEMA 17 |
 
-Matching firmware: `STEPS_PER_REV = 1600.0`, `STEPS_PER_DEG = 4.4444`.
+**Microstep** (SW1/SW2/SW3). Only **1/8 has been verified on this device**
+(SW1/2/3 = OFF/ON/OFF → 1600 pulses/rev). The rest follow the usual TB6600
+convention, so **check your own module's printed label before trusting them** —
+board makers do print this table differently, and a wrong combination is the
+single easiest way to make every lid angle wrong.
+
+| Microstep | SW1 | SW2 | SW3 | Pulses/rev | Firmware setting |
+|---|---|---|---|---|---|
+| 1/1 | ON | ON | OFF | 200 | `XD1` |
+| 1/2 | ON | OFF | ON | 400 | `XD2` |
+| 1/4 | ON | OFF | OFF | 800 | `XD4` |
+| **1/8** *(verified)* | OFF | ON | OFF | 1600 | `XD8` (default) |
+| 1/16 | OFF | OFF | ON | 3200 | `XD16` |
+
+Matching firmware default: `stepsPerRev = 1600`, `stepsPerDeg = 4.4444`.
 
 **There are two different chips sold as "TB6600".** A real Toshiba **TB6600HG**
 only goes to 1/16; the "upgrade" **TB67S109AFTG** goes to 1/32. Spot them by the
 chip: the TB6600HG has pins sticking through the PCB. On a TB6600HG the 1/32 DIP
 combination is marked `NC` in the datasheet, so selecting it puts the chip in an
-undefined mode.
+undefined mode. For that reason the firmware offers 1/1, 1/2, 1/4, 1/8 and 1/16
+and refuses 1/32.
 
-If you change microstepping, you must change `STEPS_PER_REV`, `STEPS_PER_DEG`, and
-the saved `DIP_TERMINAL` marker, then re-upload. The firmware compares the marker
-against flash at boot and logs a warning if they disagree, but it cannot guess the
-right angle for you.
+### Changing microstep no longer needs a re-upload
+
+The TB6600's microstep is set by the **physical DIP switches**; firmware cannot
+change it. What the firmware holds is the microstep it *assumes*, and that is now
+a setting rather than a compile-time constant. Tell it which DIP position you
+moved to, from the **Microstep Tutup** card on `/setting`, or with the command
+`XD<n>` where n is the divisor (`XD8`, `XD16`, `XD1`). `XD` alone reports the
+current value.
+
+Two things the firmware does when you change it:
+
+- **Keeps the reported angle.** `currentStep` is a raw step count, and 400 steps
+  is 90° at 1/8 but 45° at 1/16, so the counts are rebuilt through degrees. The
+  lid position does not jump when you switch.
+- **Rescales the step speed** so the lid keeps moving at the same physical speed.
+  Going from 1/8 to 1/16 doubles the pulses per degree, so pulses per second
+  double too.
+
+The change is refused while a lid is moving, since an in-flight move was planned
+at the old steps-per-degree. If the rescale would exceed the 50–4000 step/s
+guardrail the speed genuinely does change, and the log says so instead of hiding
+it. That only happens on the wide jumps, such as 1/1 to 1/16.
+
+The setting is saved to flash, so it survives a reboot. If the DIP switches and
+the firmware disagree, every angle is silently wrong — the page asks you to
+confirm the DIP position before it sends the change.
 
 ---
 
-## 5. Why 1/8 microstepping
+## 5. Choosing a microstep
 
 Torque per microstep, as a fraction of holding torque (Faulhaber Application
 Note 015):
 
-| Microstep | Torque per step |
-|---|---|
-| 1 | 100.00 % |
-| 2 | 70.71 % |
-| 4 | 38.27 % |
-| 8 | 19.51 % |
-| 16 | 9.80 % |
+| Microstep | Torque per step | Pulses/rev |
+|---|---|---|
+| 1/1 | 100.00 % | 200 |
+| 1/2 | 70.71 % | 400 |
+| 1/4 | 38.27 % | 800 |
+| 1/8 | 19.51 % | 1600 |
+| 1/16 | 9.80 % | 3200 |
 
 The motor's own detent torque is 5–20 % of holding torque. At 1/16, one microstep
 produces under 10 %, so a good share of pulses cannot beat the detent torque and
 produce no motion at all. The Faulhaber note puts it plainly: taking a microstep
 does not mean the motor will move.
 
-This lid drives roughly 20 gears and is heavy, so 1/8 was chosen: double the
-torque per step, resolution still far beyond what a lid needs.
+This lid drives roughly 20 gears and is heavy, so **1/8 is the default**: double
+the torque per step, resolution still far beyond what a lid needs.
+
+Which way to go, starting from 1/8:
+
+- **Lid skips or stalls, especially under load** → lower microstep (1/4, 1/2).
+  More torque per step. You trade away resolution the lid does not use.
+- **Lid moves but sounds rough or you want finer steps** → raise toward 1/16.
+  Smoother and quieter, but weaker per step, so watch for lost steps.
 
 Related: a change to 1/8 once got recorded here as "makes the stepper stop
 dead". That conclusion was wrong. The motor was silent, and a stepper short on
 torque buzzes — silence means no current at all. The real cause was the DIP switch
 moved to 1/8 while the firmware constants still said 1/16, so every commanded
-angle was wrong.
+angle was wrong. That mismatch is what the setting above is meant to prevent.
 
 ---
 
@@ -264,13 +309,16 @@ shorten the signal runs.
 
 Constants in the firmware, and what each one costs you when it is wrong.
 
-| Constant | Current | If it is wrong |
+| Setting | Current | If it is wrong |
 |---|---|---|
-| `STEPS_PER_REV` | 1600.0 | Must match the DIP microstep, or all angles are scaled wrong |
+| `microstepDiv` | 8 | Must match the DIP microstep, or all angles are scaled wrong. Set at runtime, see §4 |
 | `RAMP_MIN_STEPS` | 100.0 | Too high and short moves never reach full speed |
 | `RAMP_MAX_STEPS` | 400.0 | Too high and one 90° move is spent entirely on ramp |
 | `SLOW_FLOOR_FRAC` | 0.35 | Too low and the motor stalls at the end of a move |
 | `SPEED_MIN_SPS` | 60.0 | Too high versus target speed and the motor jumps from standstill, losing all steps |
+
+`stepsPerRev` and `stepsPerDeg` are derived from `microstepDiv` and are not edited
+directly.
 
 The ramp length is `speed × 0.5`, clamped to those bounds, and never more than half
 the move so there is always a constant-speed middle section.
@@ -325,9 +373,12 @@ Sent over HTTP (`/cmd?val=X`), Bluetooth, or serial at 115200.
 | `YL1` / `YL0` | invert / restore left motor direction |
 | `YR1` / `YR0` | same for the right motor |
 | `H1` / `H0` | hold motor locked / release after a move |
-| `X` | stop / start BLE advertising |
+| `XD<n>` | microstep divisor the firmware assumes: `XD1` `XD2` `XD4` `XD8` `XD16`. `XD` alone reports it |
+| `XB1` / `XB0` | stop / start BLE advertising |
+| `XT1` / `XT0` | tick only the moving motor / both (jitter hunt) |
 
-Angles and motor direction inverts are saved to flash, so they survive a power cut.
+Angles, motor direction inverts and the microstep are saved to flash, so they
+survive a power cut.
 
 ---
 
